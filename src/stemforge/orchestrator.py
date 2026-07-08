@@ -59,6 +59,7 @@ class SeparationCfg:
     model: str = "htdemucs_ft"
     uvr_model: str = BS_ROFORMER_MODEL
     uvr_model_dir: str = "models/uvr"
+    uvr_venv: str = ".venv-uvr"  # isolated audio-separator venv (see `stemforge setup-sota`)
     uvr_use_autocast: bool = True
     stems: list[str] = field(default_factory=lambda: ["vocals", "drums", "bass", "other"])
     segment: float = 10.0
@@ -100,8 +101,9 @@ def preset_names() -> list[str]:
 
 # Optional backend deps: missing one is a fail-soft skip (with an install hint);
 # any other ModuleNotFoundError is a real error and surfaces via the stage trace.
+# audio-separator is NOT here — it is never imported in-process; its isolated
+# venv is preflighted by separate_uvr and reported via SotaEnvError.
 _SEPARATION_DEP_HINTS = {
-    "audio_separator": "pip install 'audio-separator[gpu]'",
     "demucs": "pip install demucs",
     "torch": "install CUDA-matched torch first (see README)",
 }
@@ -387,6 +389,8 @@ class Pipeline:
         ctx.manifest["analysis"] = grid.to_dict()
 
     def _run_separation(self, ctx: RunContext) -> None:
+        from .separate_uvr import SotaEnvError
+
         cfg = self.cfg.separation
         backend = (cfg.backend or "demucs").strip().lower()
         models_used: dict[str, str] = {}
@@ -400,6 +404,10 @@ class Pipeline:
                 stems = self._separate_hybrid(ctx, cfg, models_used, notes)
             else:
                 raise ValueError(f"unknown separation backend {cfg.backend!r} (demucs | uvr | hybrid)")
+        except SotaEnvError as e:
+            # fail-soft: isolated audio-separator env not ready -> skip, never crash
+            ctx.manifest["separation"] = {"skipped": str(e)}
+            return
         except ModuleNotFoundError as e:
             root = (e.name or "").split(".")[0]
             hint = _SEPARATION_DEP_HINTS.get(root)

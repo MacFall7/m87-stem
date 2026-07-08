@@ -3,8 +3,9 @@
 Examples
 --------
     stemforge doctor
+    stemforge setup-sota                                 # one-time: isolated audio-separator venv
     stemforge separate song.wav --model htdemucs_ft -o out/
-    stemforge separate song.wav --preset sota            # BS-Roformer via audio-separator
+    stemforge separate song.wav --preset sota            # BS-Roformer via the isolated venv
     stemforge run song.wav --preset max --midi --stretch --target-bpm 120
     stemforge run song.wav --set separation.segment=8 --set midi.onset_threshold=0.6
     stemforge ui
@@ -101,17 +102,48 @@ def doctor() -> None:
     except Exception as e:  # noqa: BLE001
         t.add_row("torch", f"[red]missing[/] ({e})")
 
-    for mod in ("demucs", "audio_separator", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
+    for mod in ("demucs", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
         try:
             __import__(mod)
             t.add_row(mod, "[green]ok[/]")
         except Exception:  # noqa: BLE001
             t.add_row(mod, "[yellow]not installed[/]")
 
+    # audio-separator lives in its OWN venv (never imported in-process)
+    from .separate_uvr import find_cli, resolve_venv_dir
+
+    venv_dir = resolve_venv_dir(load_config().separation.uvr_venv)
+    cli_path = find_cli(venv_dir)
+    t.add_row(
+        "audio-separator (isolated venv)",
+        f"[green]ok[/] · {cli_path}" if cli_path else "[yellow]not set up — run `stemforge setup-sota`[/]",
+    )
+
     for name in ("ffmpeg", "rubberband"):
         t.add_row(name, "[green]ok[/]" if shutil.which(name) else "[yellow]not on PATH[/]")
 
     console.print(t)
+
+
+@app.command("setup-sota")
+def setup_sota(
+    venv: Optional[Path] = typer.Option(
+        None, "--venv", help="Venv location (default: separation.uvr_venv = <project>/.venv-uvr)."
+    ),
+) -> None:
+    """Create/repair the ISOLATED audio-separator venv (idempotent).
+
+    Installs CUDA torch (cu124 index) + audio-separator into that venv only —
+    the main environment's torch/numpy are never touched.
+    """
+    from .separate_uvr import setup_sota_env
+
+    ok = setup_sota_env(load_config().separation, venv=venv, log=console.print)
+    if ok:
+        console.print("[green]SOTA separation ready[/] — try: stemforge separate song.wav --preset sota")
+    else:
+        console.print("[red]setup incomplete[/] — fix the issue above and re-run `stemforge setup-sota`")
+        raise typer.Exit(code=1)
 
 
 @app.command()
