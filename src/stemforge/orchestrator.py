@@ -139,13 +139,17 @@ class MidiCfg:
 @dataclass
 class DrumSplitCfg:
     enabled: bool = False
-    backend: str = "uvr"  # uvr (isolated .venv-uvr) | larsnet | external (via external_cmd)
-    model: str = "drumsep_roformer"
-    parts: list[str] = field(default_factory=lambda: ["kick", "snare", "toms", "hihat", "ride", "crash"])
+    backend: str = "demucs_inagoy"  # demucs_inagoy (main-env Demucs) | uvr | larsnet | external
+    model: str = "drumsep_roformer"  # legacy label for the larsnet/external paths
+    parts: list[str] = field(default_factory=lambda: ["kick", "snare", "toms", "other"])
     from_input: bool = False  # tear down the raw input loop instead of the separated drums stem
-    uvr_model: str | None = None  # DrumSep checkpoint; None -> auto-discover (--list_filter=drums)
+    # inagoy/drumsep (default): a Demucs checkpoint run in the MAIN env, auto-downloaded.
+    inagoy_url: str = "https://huggingface.co/mnstrmnl/drumsep/resolve/main/drumsep.th"
+    inagoy_model_dir: str = "models/drumsep"
+    # uvr drum path (isolated venv) — kept as an option; audio-separator has no per-hit model.
+    uvr_model: str | None = None
     uvr_model_dir: str = "models/uvr"
-    uvr_venv: str = ".venv-uvr"  # shares the isolated audio-separator venv
+    uvr_venv: str = ".venv-uvr"
     uvr_use_autocast: bool = True
     larsnet_wiener: float = 1.0
     external_cmd: str | None = None
@@ -306,11 +310,15 @@ class Pipeline:
     Models are cached on the instance so a batch of files does not reload weights.
     """
 
-    def __init__(self, cfg: RunConfig, model_cache: dict[str, Any] | None = None):
+    def __init__(self, cfg: RunConfig, model_cache: dict[str, Any] | None = None,
+                 on_stage=None):
         self.cfg = cfg
         # Keyed "<backend>:<model name>" so a shared cache (e.g. across UI runs
         # with different presets) can never hand back the wrong weights.
         self._model_cache: dict[str, Any] = model_cache if model_cache is not None else {}
+        # Optional callback(stage_key, enabled) fired as each stage starts — the
+        # web UI maps it to progress. Never affects results; failures are ignored.
+        self._on_stage = on_stage
 
     def resolve_device(self) -> str:
         if self.cfg.device != "auto":
@@ -373,6 +381,11 @@ class Pipeline:
         return [self.run(p) for p in paths]
 
     def _stage(self, ctx: RunContext, key: str, fn, enabled: bool) -> None:
+        if self._on_stage is not None:
+            try:
+                self._on_stage(key, enabled)
+            except Exception:  # noqa: BLE001 - progress must never break the run
+                pass
         if not enabled:
             ctx.manifest.setdefault(key, {"skipped": "disabled"})
             return

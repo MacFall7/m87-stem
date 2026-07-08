@@ -122,10 +122,10 @@ def test_setup_sota_reports_failure(monkeypatch):
 
 
 def test_ui_open_flag_defaults_true_and_toggles(monkeypatch):
-    import stemforge.app as app_mod
+    import stemforge.webapp as webapp_mod
 
     seen: dict = {}
-    monkeypatch.setattr(app_mod, "launch", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(webapp_mod, "launch", lambda **kw: seen.update(kw))
 
     assert runner.invoke(cli.app, ["ui"]).exit_code == 0
     assert seen["open_browser"] is True

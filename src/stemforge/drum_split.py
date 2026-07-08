@@ -1,19 +1,21 @@
-"""§5.5 drum_split — decompose a drum loop / drums stem into kick/snare/toms/hh/…
+"""§5.5 drum_split — decompose a drum loop / drums stem into kick/snare/toms/other.
 
-Primary path (``backend: uvr``): run a DrumSep-family model through the SAME
-isolated ``.venv-uvr`` audio-separator subprocess used for stem separation
-(``separate_uvr.separate_drums``) — never the main env. The drum model is
-``drums.split.uvr_model`` when set, else auto-discovered via
-``audio-separator --list_filter=drums``. Accepts a raw drum LOOP as input, not
-only the demucs drums stem.
+Primary path (``backend: demucs_inagoy``, the default): run the **inagoy/drumsep
+Demucs checkpoint in the MAIN env** via the already-installed ``demucs`` package
+(no venv, GPU-fast). The checkpoint auto-downloads on first use into
+``models/drumsep/`` (``drums.split.inagoy_url`` / ``inagoy_model_dir``). It
+splits a drum loop/stem into kick/snare/toms/other. audio-separator's registry
+has NO per-hit drum model — its ``--list_filter=drums`` models only isolate the
+kit — so the previous ``uvr`` drum path never produced hits; it remains as an
+option but is no longer the default.
 
 Fallback (``external_cmd``): any repo-based separator via a shell template::
 
     external_cmd: "python /opt/drumsep/infer.py --in {input} --out {output_dir}"
 
-Placeholders ``{input}`` / ``{output_dir}`` are substituted. All paths fail
-soft: a missing venv / ffmpeg / drum model records ``{"skipped": ...}`` with a
-fix hint so the pipeline continues.
+All paths fail soft: a model that can't download / load records
+``{"skipped": ...}`` with a fix hint so the pipeline continues. The produced
+parts feed the existing parts-based ``drum_midi`` (onset + RMS-velocity + GM).
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     DrumSplitCfg = Any  # type: ignore
 
+# Anchor for a relative model dir, so the checkpoint cache is shared, not per-cwd.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 # Canonical parts and the filename keywords we use to map arbitrary outputs to them.
 _PART_KEYWORDS = {
     "kick": ("kick", "bd", "bassdrum"),
@@ -39,6 +44,17 @@ _PART_KEYWORDS = {
     "ride": ("ride",),
     "crash": ("crash", "cymbal", "cym"),
 }
+
+# inagoy/drumsep emits 4 sources (labels vary / are Spanish in some builds);
+# map by keyword, with a positional fallback in kit order.
+_INAGOY_ALIASES = {
+    "kick": ("kick", "bombo", "bd", "bass drum", "bassdrum"),
+    "snare": ("snare", "redoblante", "caja", "sd"),
+    "toms": ("toms", "tom"),
+    "other": ("other", "platillos", "cymbals", "cymbal", "hihat", "hi-hat",
+              "hh", "crash", "ride", "resto", "rest"),
+}
+_INAGOY_POSITIONAL = ["kick", "snare", "toms", "other"]
 
 
 def split(
@@ -55,13 +71,16 @@ def split(
     ``external_cmd`` path always works from a file (``drums_path``).
     """
     out_dir = ensure_dir(Path(out_dir))
-    backend = (getattr(cfg, "backend", "uvr") or "uvr").strip().lower()
+    backend = (getattr(cfg, "backend", "demucs_inagoy") or "demucs_inagoy").strip().lower()
 
     # Explicit external command wins (repo-based DrumSep/LarsNet), any backend.
     if cfg.external_cmd:
         if drums_path is None or not Path(drums_path).is_file():
             return {"skipped": "external_cmd needs a drums file (run separation first)"}
         return _run_external(cfg.external_cmd, drums_path, out_dir, cfg)
+
+    if backend == "demucs_inagoy":
+        return _demucs_inagoy_split(_source_audio(audio, drums_path), cfg, out_dir, device)
 
     if backend == "uvr":
         return _uvr_split(audio, drums_path, cfg, out_dir)
@@ -85,6 +104,125 @@ def split(
 
 class _NotWired(RuntimeError):
     pass
+
+
+class _DrumModelUnavailable(RuntimeError):
+    """The inagoy checkpoint can't be fetched/loaded — fail soft (skip)."""
+
+
+def _source_audio(audio: AudioTensor | None, drums_path: PathLike | None) -> AudioTensor | None:
+    if audio is not None:
+        return audio
+    if drums_path is not None and Path(drums_path).is_file():
+        return load_audio(drums_path)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# inagoy/drumsep backend — Demucs checkpoint in the MAIN env (default)
+# --------------------------------------------------------------------------- #
+def _demucs_inagoy_split(
+    audio: AudioTensor | None, cfg: "DrumSplitCfg", out_dir: Path, device: str,
+) -> dict[str, Any]:
+    if audio is None:
+        return {"skipped": "no drum audio (drop a drum loop or run separation first)"}
+
+    try:
+        model, model_name = _load_inagoy_model(cfg, device)
+    except _DrumModelUnavailable as e:
+        return {"skipped": f"{e}", "backend": "demucs_inagoy"}
+    except ModuleNotFoundError as e:  # demucs / torch not installed
+        return {"skipped": f"demucs not installed ({e.name}); pip install demucs",
+                "backend": "demucs_inagoy"}
+
+    try:
+        from . import separate as sep
+
+        sources = sep.apply_model_to_audio(model, audio, device=device)
+    except RuntimeError as e:  # OOM / runtime failure inside a loaded model
+        return {"error": f"inagoy drumsep failed: {e}", "backend": "demucs_inagoy"}
+
+    parts = _map_inagoy_sources(sources)
+    wanted = set(cfg.parts) if getattr(cfg, "parts", None) else None
+    files: dict[str, str] = {}
+    for part, tensor in parts.items():
+        if wanted is not None and part not in wanted and part != "other":
+            continue
+        files[part] = str(save_audio(out_dir / f"{part}.wav", tensor))
+    if not files:
+        return {"skipped": "inagoy drumsep produced no recognizable parts",
+                "backend": "demucs_inagoy"}
+    return {"backend": "demucs_inagoy", "model": model_name,
+            "parts": list(files), "files": files}
+
+
+def _map_inagoy_sources(sources: dict[str, AudioTensor]) -> dict[str, "AudioTensor"]:
+    """Map the model's 4 sources to canonical kick/snare/toms/other.
+
+    Prefer name/keyword matches (English or Spanish labels); fall back to kit
+    order for anything unmatched so no source is dropped."""
+    out: dict[str, AudioTensor] = {}
+    remaining = dict(sources)
+    for canon, aliases in _INAGOY_ALIASES.items():
+        for name, tensor in list(remaining.items()):
+            if any(a in name.lower() for a in aliases):
+                out[canon] = tensor
+                remaining.pop(name)
+                break
+    leftovers = list(remaining.values())
+    for canon in _INAGOY_POSITIONAL:
+        if canon not in out and leftovers:
+            out[canon] = leftovers.pop(0)
+    return out
+
+
+def _inagoy_filename(url: str) -> str:
+    name = url.rsplit("/", 1)[-1].split("?")[0]
+    return name or "inagoy_drumsep.th"
+
+
+def _ensure_inagoy_checkpoint(cfg: "DrumSplitCfg") -> Path:
+    model_dir = Path(cfg.inagoy_model_dir).expanduser()
+    if not model_dir.is_absolute():
+        model_dir = _PROJECT_ROOT / model_dir
+    ensure_dir(model_dir)
+    dest = model_dir / _inagoy_filename(cfg.inagoy_url or "")
+    if dest.is_file():
+        return dest
+    if not cfg.inagoy_url:
+        raise _DrumModelUnavailable(
+            "no inagoy drumsep URL — set drums.split.inagoy_url to the checkpoint"
+        )
+    import urllib.request
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        urllib.request.urlretrieve(cfg.inagoy_url, tmp)  # noqa: S310 - user-configured URL
+        tmp.replace(dest)
+    except Exception as e:  # noqa: BLE001 - any network/FS failure -> fail soft
+        tmp.unlink(missing_ok=True)
+        raise _DrumModelUnavailable(
+            f"could not download inagoy drumsep model ({e}); set drums.split.inagoy_url "
+            f"or drop the checkpoint into {model_dir}"
+        ) from e
+    return dest
+
+
+def _load_inagoy_model(cfg: "DrumSplitCfg", device: str):
+    """Download (if needed) + load the inagoy drumsep Demucs checkpoint."""
+    dest = _ensure_inagoy_checkpoint(cfg)
+    from demucs.states import load_model  # lazy: main-env demucs
+
+    try:
+        model = load_model(str(dest))
+    except Exception as e:  # noqa: BLE001 - corrupt/incompatible checkpoint -> fail soft
+        raise _DrumModelUnavailable(
+            f"could not load inagoy drumsep checkpoint {dest.name} ({e}); "
+            f"re-download or set drums.split.inagoy_url"
+        ) from e
+    model.to(device)
+    model.eval()
+    return model, dest.name
 
 
 # --------------------------------------------------------------------------- #
@@ -174,4 +312,4 @@ def _larsnet(drums_path: PathLike, out_dir: Path, cfg: "DrumSplitCfg", device: s
 
 
 def available_models() -> list[str]:
-    return ["uvr", "drumsep_roformer", "larsnet", "inagoy"]
+    return ["demucs_inagoy", "uvr", "larsnet", "external"]
