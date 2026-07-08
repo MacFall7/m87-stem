@@ -22,6 +22,11 @@ const WORKFLOWS = {
     glyph: "✦", endpoint: "/api/full-teardown", cta: "Full Teardown",
     quality: true, melodic: false, dz: "Drop a track",
   },
+  matchbpm: {
+    title: "Match BPM", sub: "Stretch a whole file to a target BPM · pitch preserved",
+    glyph: "⇋", endpoint: "/api/match-bpm", cta: "Match BPM",
+    quality: false, melodic: false, matchbpm: true, dz: "Drop a track",
+  },
 };
 const QUALITY = ["Fast", "Best", "SOTA", "Max"];
 
@@ -75,8 +80,13 @@ function selectWorkflow(id) {
   $("run-btn").textContent = wf.cta;
   $("ctrl-quality").hidden = !wf.quality;
   $("ctrl-melodic").hidden = !wf.melodic;
+  $("ctrl-matchbpm").hidden = !wf.matchbpm;
   $("results").hidden = true;
   $("head-meta").hidden = true;
+  if (wf.matchbpm) {
+    $("detect-note").textContent = "drop a file, then detect (or type the source below)";
+    $("detect-note").classList.remove("detected");
+  }
   renderRail();
 }
 
@@ -130,6 +140,18 @@ async function run() {
   if (wf.melodic) {
     fd.append("monophonic", $("opt-mono").checked);
     fd.append("quantize", $("opt-quant").checked);
+  }
+  if (wf.matchbpm) {
+    const target = parseFloat($("target-bpm").value);
+    if (!target || target <= 0) {
+      $("detect-note").textContent = "enter a target BPM first";
+      $("detect-note").classList.remove("detected");
+      return;
+    }
+    fd.append("target_bpm", target);
+    const src = parseFloat($("source-bpm").value);
+    if (src > 0) fd.append("source_bpm", src);
+    fd.append("engine", $("mb-engine").value);
   }
 
   showProgress(0.05, "Uploading…");
@@ -259,9 +281,36 @@ function downloadBtn(url, filename) {
   return b;
 }
 
+/* ---------------------------- detect BPM -------------------------------- */
+async function detectBpm() {
+  if (!state.file) {
+    $("detect-note").textContent = "drop a file first";
+    return;
+  }
+  const note = $("detect-note");
+  note.classList.remove("detected");
+  note.textContent = "detecting…";
+  const fd = new FormData();
+  fd.append("file", state.file);
+  fd.append("device", state.device);
+  try {
+    const r = await (await fetch("/api/detect-bpm", { method: "POST", body: fd })).json();
+    if (!r.bpm) {
+      note.textContent = "couldn't detect a BPM — type the source override below";
+      return;
+    }
+    if (!$("target-bpm").value) $("target-bpm").value = Math.round(r.bpm);
+    note.classList.add("detected");
+    note.textContent = `detected ${r.bpm} BPM · half ${r.half} · double ${r.double} — wrong? set the source override`;
+  } catch {
+    note.textContent = "detection failed — type the source override below";
+  }
+}
+
 /* ------------------------- footer actions ------------------------------- */
 function setupActions() {
   $("run-btn").addEventListener("click", run);
+  $("detect-btn").addEventListener("click", detectBpm);
   $("download-all").addEventListener("click", () => {
     if (state.lastOutDir) window.location = `/api/download-all?dir=${encodeURIComponent(state.lastOutDir)}`;
   });

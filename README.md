@@ -1,11 +1,12 @@
 # StemForge
 
-Local, GPU-accelerated audio workstation. One machine, four capabilities over a single shared analysis pass:
+Local, GPU-accelerated audio workstation. One machine, five capabilities over a single shared analysis pass:
 
 1. **Stem separation** — full mix → `vocals / drums / bass / other` (+ `guitar / piano`), three backends: Demucs, **BS-Roformer (SOTA)** via audio-separator, and a hybrid of both
 2. **Melodic MIDI** — each melodic stem → `.mid` (notes + pitch bends)
 3. **BPM time-stretch** — any stem → retimed to a target BPM, pitch preserved
 4. **Drum teardown** — a drum loop *or* the drums stem → `kick / snare / toms / other` hit stems + a GM drum `.mid` (velocity-aware), via the inagoy/drumsep Demucs model in the main env
+5. **Match BPM** — a whole file → stretched to a target BPM, pitch preserved, no separation (with a source-BPM override to defeat half/double detection errors)
 
 One analysis pass produces the tempo map + beat grid **once**; every downstream module consumes it, so all outputs stay phase- and grid-aligned.
 
@@ -95,6 +96,10 @@ stemforge run song.wav \
   --preset max --target-bpm 120 \
   --midi --drum-split --drum-midi --stretch -o out/
 
+# Match a whole file to a target BPM (pitch preserved, no separation)
+stemforge match-bpm song.mp3 -t 120          # detect the source, stretch to 120
+stemforge match-bpm song.mp3 -t 120 -s 140   # override detection (half/double fix)
+
 # Launch the local web UI (opens your browser automatically)
 stemforge ui
 ```
@@ -115,6 +120,7 @@ deep-space console with a left workflow rail and four panels, no page reloads:
 - **Drum Teardown** — drop a drum loop (or a drums stem) → per-hit stems + a GM drum `.mid`; preview each hit.
 - **Melodic → MIDI** — a stem or a mix → `.mid`, with monophonic and quantize-to-grid toggles.
 - **Full Teardown** — one drop → stems + drum hits + MIDI + tempo, a grid-aligned bundle with `manifest.json`.
+- **Match BPM** — a whole file → stretched to a target BPM, pitch preserved (Detect BPM prefills the target and shows half/double; a source-BPM box overrides mis-detection). No separation.
 
 Every input and result gets a wavesurfer.js waveform with play/solo/download; a
 BPM chip, download-all, and open-folder are one click. All theme colors/fonts are

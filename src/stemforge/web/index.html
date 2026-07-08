@@ -66,6 +66,24 @@
             <label class="switch"><input type="checkbox" id="opt-mono" /><span>Monophonic</span></label>
             <label class="switch"><input type="checkbox" id="opt-quant" /><span>Quantize to grid</span></label>
           </div>
+          <div class="ctrl matchbpm" id="ctrl-matchbpm" hidden>
+            <div class="mb-row">
+              <button class="btn" id="detect-btn" type="button">Detect BPM</button>
+              <span class="mono-sub" id="detect-note">drop a file, then detect (or type the source below)</span>
+            </div>
+            <div class="mb-row">
+              <label class="mb-field"><span class="mono-label">Target BPM</span>
+                <input type="number" id="target-bpm" min="1" step="0.5" placeholder="120" /></label>
+              <label class="mb-field"><span class="mono-label">Source override</span>
+                <input type="number" id="source-bpm" min="1" step="0.5" placeholder="auto" /></label>
+              <label class="mb-field"><span class="mono-label">Engine</span>
+                <select id="mb-engine">
+                  <option value="rubberband">rubberband</option>
+                  <option value="signalsmith">signalsmith</option>
+                  <option value="librosa">librosa</option>
+                </select></label>
+            </div>
+          </div>
           <button class="cta" id="run-btn" disabled>Extract Stems</button>
         </div>
 
