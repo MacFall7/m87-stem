@@ -7,7 +7,8 @@ Examples
     stemforge separate song.wav --model htdemucs_ft -o out/
     stemforge separate song.wav --preset sota            # BS-Roformer via the isolated venv
     stemforge run song.wav --preset max --midi --stretch --target-bpm 120
-    stemforge run song.wav --set separation.segment=8 --set midi.onset_threshold=0.6
+    stemforge match-bpm song.mp3 -t 120                  # stretch a whole file, pitch preserved
+    stemforge match-bpm song.mp3 -t 120 -s 140           # override half/double detection
     stemforge ui
 """
 
@@ -190,6 +191,51 @@ def analyze(
     })
     manifest = Pipeline(cfg).run(input)
     console.print(manifest.get("analysis", {}))
+
+
+@app.command("match-bpm")
+def match_bpm(
+    input: Path = typer.Argument(..., exists=True, dir_okay=False, help="Audio file (any format)."),
+    target_bpm: float = typer.Option(..., "-t", "--target-bpm", help="Target BPM (required)."),
+    source_bpm: Optional[float] = typer.Option(
+        None, "-s", "--source-bpm",
+        help="Override the detected source BPM (defeats half/double-tempo errors).",
+    ),
+    out: Path = typer.Option(Path("out"), "-o", "--out", help="Output root."),
+    engine: str = typer.Option("rubberband", help="rubberband | signalsmith | librosa"),
+    detect_engine: str = typer.Option("beat_this", "--detect-engine", help="beat_this | librosa"),
+    device: str = typer.Option("auto", help="auto | cuda | cpu"),
+) -> None:
+    """Match a WHOLE file to a target BPM (pitch preserved, no separation)."""
+    from . import stretch
+    from .io_utils import slugify
+
+    out_dir = Path(out) / slugify(input.stem) / "matched"
+    res = stretch.match_bpm_file(
+        str(input), target_bpm, out_dir, source_bpm=source_bpm,
+        engine=engine, detect_engine=detect_engine, device=device,
+    )
+
+    t = Table(title=f"Match BPM · {input.name}", show_header=True)
+    t.add_column("field")
+    t.add_column("value", overflow="fold")
+    if "skipped" in res:
+        t.add_row("skipped", f"[yellow]{res['skipped']}[/]")
+    elif "error" in res:
+        t.add_row("error", f"[red]{res['error']}[/]")
+    else:
+        src_note = "[cyan]overridden[/]" if res["source_bpm_overridden"] else "detected"
+        t.add_row("source BPM", f"{res['source_bpm']} ({src_note})")
+        if not res["source_bpm_overridden"]:
+            d = res["source_bpm_detected"]
+            t.add_row("half / double", f"{round(d/2, 1)} / {round(d*2, 1)} (re-run with -s to override)")
+        t.add_row("target BPM", str(res["target_bpm"]))
+        t.add_row("ratio", str(res["ratio"]))
+        t.add_row("engine", res["engine"])
+        t.add_row("output", res["output"])
+    console.print(t)
+    if "skipped" in res or "error" in res:
+        raise typer.Exit(code=1)
 
 
 @app.command()

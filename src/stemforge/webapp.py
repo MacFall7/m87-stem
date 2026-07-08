@@ -36,7 +36,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote
 
 from .orchestrator import Pipeline, load_config, preset_names
@@ -121,30 +121,10 @@ def run_job(job_id: str, workflow: str, input_path: Path, params: dict[str, Any]
     """Execute one workflow, updating the job store. Never raises."""
     job = _JOBS[job_id]
     try:
-        cfg = load_config(overrides=_overrides(workflow, params))
-
-        def on_stage(key: str, enabled: bool) -> None:
-            if enabled and key in _STAGE_PROGRESS:
-                frac, label = _STAGE_PROGRESS[key]
-                job.update(progress=frac, stage=key, message=label)
-
-        job.update(status="running", progress=0.05, message="Ingesting audio")
-        pipe = Pipeline(cfg, model_cache=_MODEL_CACHE, on_stage=on_stage)
-        manifest = pipe.run(input_path)
-
-        out_dir = _out_dir_for(cfg, manifest)
-        analysis = manifest.get("analysis", {})
-        job.update(
-            status="done", progress=1.0, message="Done",
-            result={
-                "workflow": workflow,
-                "out_dir": str(out_dir.resolve()),
-                "bpm": analysis.get("source_bpm"),
-                "key": analysis.get("key"),
-                "cards": _cards(out_dir),
-                "manifest": manifest,
-            },
-        )
+        if workflow == "match-bpm":
+            _run_match_bpm(job, input_path, params)
+        else:
+            _run_pipeline_job(job, workflow, input_path, params)
     except Exception as e:  # noqa: BLE001 - surface as a job error, don't crash the server
         job.update(status="error", progress=1.0, message=str(e), error=str(e))
     finally:
@@ -152,6 +132,70 @@ def run_job(job_id: str, workflow: str, input_path: Path, params: dict[str, Any]
             input_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _run_pipeline_job(job: dict, workflow: str, input_path: Path, params: dict[str, Any]) -> None:
+    cfg = load_config(overrides=_overrides(workflow, params))
+
+    def on_stage(key: str, enabled: bool) -> None:
+        if enabled and key in _STAGE_PROGRESS:
+            frac, label = _STAGE_PROGRESS[key]
+            job.update(progress=frac, stage=key, message=label)
+
+    job.update(status="running", progress=0.05, message="Ingesting audio")
+    pipe = Pipeline(cfg, model_cache=_MODEL_CACHE, on_stage=on_stage)
+    manifest = pipe.run(input_path)
+
+    out_dir = _out_dir_for(cfg, manifest)
+    analysis = manifest.get("analysis", {})
+    job.update(
+        status="done", progress=1.0, message="Done",
+        result={
+            "workflow": workflow,
+            "out_dir": str(out_dir.resolve()),
+            "bpm": analysis.get("source_bpm"),
+            "key": analysis.get("key"),
+            "cards": _cards(out_dir),
+            "manifest": manifest,
+        },
+    )
+
+
+def _run_match_bpm(job: dict, input_path: Path, params: dict[str, Any]) -> None:
+    """Whole-file Match BPM — runs `stretch.match_bpm_file`, not the Pipeline."""
+    from . import stretch
+    from .io_utils import slugify
+
+    cfg = load_config()
+    out_dir = Path(cfg.output.root) / slugify(input_path.stem) / "matched"
+    job.update(status="running", progress=0.15, message="Detecting tempo & stretching")
+    res = stretch.match_bpm_file(
+        input_path, float(params.get("target_bpm") or 0),
+        out_dir,
+        source_bpm=params.get("source_bpm"),
+        engine=params.get("engine", "rubberband"),
+        detect_engine=params.get("detect_engine", "beat_this"),
+        device=params.get("device", "auto"),
+    )
+    if "skipped" in res:
+        job.update(status="done", progress=1.0, message=res["skipped"],
+                   result={"workflow": "match-bpm", "out_dir": str(out_dir.resolve()),
+                           "bpm": None, "cards": [], "manifest": res})
+        return
+    if "error" in res:
+        job.update(status="error", progress=1.0, message=res["error"], error=res["error"])
+        return
+    job.update(
+        status="done", progress=1.0, message="Done",
+        result={
+            "workflow": "match-bpm",
+            "out_dir": str(out_dir.resolve()),
+            "bpm": res["target_bpm"],
+            "source_bpm": res["source_bpm"],
+            "cards": _cards(out_dir),
+            "manifest": res,
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +267,30 @@ def create_app():
     async def full_teardown(file: UploadFile = File(...), preset: str = Form("best"),
                             device: str = Form("auto")):
         return await _accept("full-teardown", file, {"preset": preset, "device": device})
+
+    @app.post("/api/match-bpm")
+    async def match_bpm(file: UploadFile = File(...), target_bpm: float = Form(...),
+                        source_bpm: Optional[float] = Form(None),
+                        engine: str = Form("rubberband"),
+                        detect_engine: str = Form("beat_this"),
+                        device: str = Form("auto")):
+        return await _accept("match-bpm", file, {
+            "target_bpm": target_bpm, "source_bpm": source_bpm,
+            "engine": engine, "detect_engine": detect_engine, "device": device,
+        })
+
+    @app.post("/api/detect-bpm")
+    async def detect_bpm_route(file: UploadFile = File(...),
+                               detect_engine: str = Form("beat_this"),
+                               device: str = Form("auto")):
+        from fastapi.concurrency import run_in_threadpool
+
+        data = await file.read()
+        bpm = await run_in_threadpool(_detect_bpm_bytes, data,
+                                      Path(file.filename or "input").suffix, detect_engine, device)
+        half = round(bpm / 2, 1) if bpm > 0 else 0.0
+        double = round(bpm * 2, 1) if bpm > 0 else 0.0
+        return {"bpm": round(bpm, 1), "half": half, "double": double}
 
     @app.get("/api/job/{job_id}")
     def job_status(job_id: str) -> dict[str, Any]:
@@ -313,6 +381,25 @@ def health_status() -> dict[str, Any]:
         "presets": preset_names(),
         "version": _version(),
     }
+
+
+def _detect_bpm_bytes(data: bytes, suffix: str, engine: str, device: str) -> float:
+    """Decode uploaded bytes and detect BPM (0.0 on any failure — fail-soft)."""
+    import tempfile
+
+    from . import ingest, stretch
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix or ".wav", delete=False) as f:
+            f.write(data)
+            tmp = Path(f.name)
+        try:
+            audio = ingest.decode(tmp)
+            return stretch.detect_bpm(audio, engine=engine, device=device)
+        finally:
+            tmp.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def reveal_folder(folder: str) -> str:

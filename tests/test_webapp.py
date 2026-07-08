@@ -195,6 +195,76 @@ def test_unknown_job_is_404(client):
     assert client.get("/api/job/deadbeef").status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# Match BPM (whole-file) — stretch.match_bpm_file mocked
+# --------------------------------------------------------------------------- #
+def test_match_bpm_route(client, monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def fake_match(input_path, target_bpm, out_dir, source_bpm=None,
+                   engine="rubberband", detect_engine="beat_this", device="auto", out_name=None):
+        seen.update(target_bpm=target_bpm, source_bpm=source_bpm, engine=engine)
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "song_140bpm.wav").write_bytes(b"RIFFfake")
+        return {"engine": engine, "detect_engine": detect_engine, "source_bpm": 120.0,
+                "source_bpm_detected": 0.0, "source_bpm_overridden": source_bpm is not None,
+                "target_bpm": target_bpm, "ratio": round(target_bpm / 120.0, 4),
+                "input": str(input_path), "output": str(out / "song_140bpm.wav")}
+
+    import stemforge.stretch as stretch_mod
+    monkeypatch.setattr(stretch_mod, "match_bpm_file", fake_match)
+
+    r = client.post("/api/match-bpm", files={"file": ("song.wav", _wav_bytes(), "audio/wav")},
+                    data={"target_bpm": "140", "source_bpm": "120", "engine": "librosa"})
+    job = _poll(client, r.json()["job_id"])
+    assert job["status"] == "done"
+    assert seen["target_bpm"] == 140.0 and seen["source_bpm"] == 120.0 and seen["engine"] == "librosa"
+
+    result = job["result"]
+    assert result["bpm"] == 140.0 and result["source_bpm"] == 120.0
+    assert [c["name"] for c in result["cards"]] == ["song_140bpm"]
+    assert result["cards"][0]["group"] == "matched"
+    assert client.get(result["cards"][0]["url"]).status_code == 200
+
+
+def test_match_bpm_skip_is_done_with_note(client, monkeypatch):
+    import stemforge.stretch as stretch_mod
+    monkeypatch.setattr(stretch_mod, "match_bpm_file",
+                        lambda *a, **k: {"skipped": "no detectable BPM; pass source_bpm to override"})
+    r = client.post("/api/match-bpm", files={"file": ("song.wav", _wav_bytes(), "audio/wav")},
+                    data={"target_bpm": "140"})
+    job = _poll(client, r.json()["job_id"])
+    assert job["status"] == "done"
+    assert job["result"]["cards"] == []
+    assert "source_bpm" in job["message"]
+
+
+def test_detect_bpm_route(client, monkeypatch):
+    import stemforge.stretch as stretch_mod
+    monkeypatch.setattr(stretch_mod, "detect_bpm", lambda audio, **k: 87.0)
+    # decode is invoked before detect_bpm; stub it so no real audio is needed
+    import stemforge.ingest as ingest_mod
+    monkeypatch.setattr(ingest_mod, "decode", lambda *a, **k: object())
+
+    r = client.post("/api/detect-bpm", files={"file": ("song.wav", _wav_bytes(), "audio/wav")},
+                    data={"detect_engine": "librosa"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"bpm": 87.0, "half": 43.5, "double": 174.0}
+
+
+def test_detect_bpm_route_failsoft_zero(client, monkeypatch):
+    import stemforge.ingest as ingest_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("bad audio")
+
+    monkeypatch.setattr(ingest_mod, "decode", boom)
+    r = client.post("/api/detect-bpm", files={"file": ("x.wav", _wav_bytes(), "audio/wav")})
+    assert r.status_code == 200 and r.json() == {"bpm": 0.0, "half": 0.0, "double": 0.0}
+
+
 def test_open_folder_message(client):
     r = client.post("/api/open-folder", json={"path": "/definitely/not/a/dir"})
     assert r.status_code == 200 and "run a workflow" in r.json()["message"].lower()

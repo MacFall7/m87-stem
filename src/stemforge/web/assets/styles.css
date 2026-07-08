@@ -153,6 +153,19 @@ body {
 .switch { display: inline-flex; align-items: center; gap: 8px; font-size: .82rem; color: var(--text-dim); cursor: pointer; }
 .switch input { accent-color: var(--cyan); width: 16px; height: 16px; }
 
+/* Match BPM controls */
+.matchbpm { gap: 12px; flex: 1 1 100%; }
+.mb-row { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+.mb-row #detect-note { color: var(--text-dim); }
+.mb-field { display: flex; flex-direction: column; gap: 6px; }
+.mb-field input, .mb-field select {
+  background: rgba(10, 14, 26, .6); border: 1px solid var(--hairline); color: var(--text);
+  border-radius: 10px; padding: 9px 12px; font-family: var(--font-mono); font-size: .82rem;
+  min-width: 118px;
+}
+.mb-field input:focus, .mb-field select:focus { outline: none; border-color: var(--cyan); }
+#detect-note.detected { color: var(--cyan); }
+
 .cta {
   margin-left: auto; padding: 13px 28px; border: 0; border-radius: 12px; cursor: pointer;
   background: var(--grad-primary); color: #05070d; font-weight: 700;

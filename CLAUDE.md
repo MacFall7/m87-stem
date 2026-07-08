@@ -28,14 +28,20 @@ bespoke **FastAPI web app** (the M87 workstation — Gradio has been retired).
   `.venv-uvr`) is kept but is NOT the default — audio-separator's registry has
   no per-hit drum model. Accepts a raw drum LOOP (`from_input`); parts feed the
   existing parts-based `drum_midi` (onset + RMS-velocity + GM mapping).
-- `src/stemforge/cli.py` — Typer CLI (`doctor|setup-sota|separate|analyze|run|ui|desktop-shortcut`).
+- `src/stemforge/stretch.py` — pitch-preserving time-stretch (rubberband →
+  signalsmith → librosa chain). `stretch_stems` retimes the separated stems;
+  `detect_bpm()` + `match_bpm_file()` power the whole-file **Match BPM** workflow
+  (no separation): decode → detect (or `source_bpm` override for half/double
+  errors) → stretch the whole file → one `<stem>_<bpm>bpm.wav`. Fail-soft.
+- `src/stemforge/cli.py` — Typer CLI (`doctor|setup-sota|separate|analyze|run|match-bpm|ui|desktop-shortcut`).
 - `src/stemforge/webapp.py` + `src/stemforge/web/` — the **M87 workstation**: a
-  FastAPI backend (job-based; `/api/{extract,drum-teardown,melodic-midi,full-teardown}`,
-  poll `/api/job/{id}` or SSE `/api/progress/{id}`, `/api/file`, `/api/download-all`,
-  `/api/open-folder`, `/api/health`) serving a static single-page front-end
-  (`web/index.html` + `web/assets/{styles.css,app.js}`, wavesurfer.js from cdnjs).
-  All colors/fonts are CSS variables at the top of `styles.css` (`--bg`, `--cyan`,
-  `--violet`, `--grad-primary`, …). Launched by `stemforge ui` (uvicorn).
+  FastAPI backend (job-based; `/api/{extract,drum-teardown,melodic-midi,full-teardown,match-bpm}`
+  + `/api/detect-bpm`, poll `/api/job/{id}` or SSE `/api/progress/{id}`,
+  `/api/file`, `/api/download-all`, `/api/open-folder`, `/api/health`) serving a
+  static single-page front-end (`web/index.html` + `web/assets/{styles.css,app.js}`,
+  wavesurfer.js from cdnjs). All colors/fonts are CSS variables at the top of
+  `styles.css` (`--bg`, `--cyan`, `--violet`, `--grad-primary`, …). Launched by
+  `stemforge ui` (uvicorn).
 - `tests/` — **GPU-free**; every heavy dep is mocked. The FastAPI routes run with
   the Pipeline mocked (`tests/test_webapp.py`); the drum backends mock demucs /
   the audio-separator CLI (`tests/test_drum_split.py`); synthetic audio from
@@ -157,12 +163,14 @@ stemforge setup-sota      # .venv-uvr: CUDA torch + audio-separator[gpu], cu124 
 ## Launch the app
 
 - The UI is the **M87 workstation** — a bespoke FastAPI backend (`webapp.py`)
-  serving a static SPA (`web/`), **not Gradio** (retired). One page, four
+  serving a static SPA (`web/`), **not Gradio** (retired). One page, five
   workflows via a left rail (Extract Stems · Drum Teardown · Melodic → MIDI ·
-  Full Teardown), no page reloads. Deep-space theme; all colors/fonts are CSS
-  variables at the top of `web/assets/styles.css` (`--bg`, `--surface`, `--cyan`,
-  `--violet`, `--indigo`, `--grad-primary`, `--text`, `--font-mono`, …) — swap
-  them for exact M87 tokens. Real waveforms via wavesurfer.js (cdnjs).
+  Full Teardown · Match BPM), no page reloads. Match BPM has its own controls
+  (Detect BPM button → surfaces detected/half/double, a Target + Source-override
+  box, engine select). Deep-space theme; all colors/fonts are CSS variables at
+  the top of `web/assets/styles.css` (`--bg`, `--surface`, `--cyan`, `--violet`,
+  `--indigo`, `--grad-primary`, `--text`, `--font-mono`, …) — swap them for exact
+  M87 tokens. Real waveforms via wavesurfer.js (cdnjs).
 - **CLI:** `stemforge ui` runs uvicorn and (by default) opens the browser once
   the server is up; `--no-open` suppresses it (`webapp.launch(open_browser=…)`).
 - Progress: each POST starts a background job; the SPA polls `/api/job/{id}`

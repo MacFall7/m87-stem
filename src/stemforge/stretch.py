@@ -16,12 +16,23 @@ from typing import Any
 
 import numpy as np
 
-from .io_utils import AudioTensor, PathLike, load_audio, save_audio
+from .io_utils import AudioTensor, PathLike, load_audio, save_audio, slugify
 
 try:  # pragma: no cover
     from .orchestrator import StretchCfg
 except Exception:  # pragma: no cover
     StretchCfg = Any  # type: ignore
+
+
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:  # noqa: BLE001
+        return "cpu"
 
 
 def time_stretch(
@@ -81,6 +92,81 @@ def _librosa(audio: AudioTensor, ratio: float) -> AudioTensor:
     n = min(len(c) for c in chans)
     out = np.stack([c[:n] for c in chans], axis=0)
     return AudioTensor(out.astype(np.float32), audio.sample_rate)
+
+
+# --------------------------------------------------------------------------- #
+# Whole-file "Match BPM" (no separation)
+# --------------------------------------------------------------------------- #
+def detect_bpm(audio: AudioTensor, engine: str = "beat_this", device: str = "auto") -> float:
+    """Return the source BPM of ``audio`` (0.0 if none detectable).
+
+    Runs the shared analysis engine (``beat_this`` → librosa fallback). Never
+    raises — a detection failure returns 0.0 so callers can fail soft.
+    """
+    from . import analysis
+
+    try:
+        grid = analysis.analyze(audio, engine=engine, device=_resolve_device(device))
+        bpm = float(getattr(grid, "source_bpm", 0.0) or 0.0)
+        return bpm if bpm > 0 else 0.0
+    except Exception:  # noqa: BLE001 - detection is best-effort
+        return 0.0
+
+
+def match_bpm_file(
+    input_path: PathLike,
+    target_bpm: float,
+    out_dir: PathLike,
+    source_bpm: float | None = None,
+    engine: str = "rubberband",
+    crisp: int = 5,
+    detect_engine: str = "beat_this",
+    device: str = "auto",
+    out_name: str | None = None,
+) -> dict[str, Any]:
+    """Stretch a WHOLE file to ``target_bpm`` (pitch preserved, no separation).
+
+    ``source_bpm`` (>0) overrides detection — the escape hatch for half/double
+    tempo detection errors. Fail-soft: returns ``{"skipped": ...}`` for a
+    non-positive target or an undetectable source, ``{"error": ...}`` for a
+    decode/stretch failure; never raises.
+    """
+    if not target_bpm or float(target_bpm) <= 0:
+        return {"skipped": "target_bpm must be > 0"}
+
+    try:
+        from . import ingest
+
+        audio = ingest.decode(input_path)  # mp3/m4a via ffmpeg, wav/flac direct
+
+        overridden = source_bpm is not None and float(source_bpm) > 0
+        detected = 0.0
+        if overridden:
+            src = float(source_bpm)
+        else:
+            detected = detect_bpm(audio, engine=detect_engine, device=device)
+            src = detected
+        if src <= 0:
+            return {"skipped": "no detectable BPM; pass source_bpm to override"}
+
+        ratio = float(target_bpm) / src
+        out = time_stretch(audio, ratio, engine=engine, crisp=crisp)
+        stem = out_name or f"{slugify(Path(input_path).stem)}_{int(round(float(target_bpm)))}bpm.wav"
+        outp = save_audio(Path(out_dir) / stem, out)
+    except Exception as e:  # noqa: BLE001 - never raise; surface as a soft error
+        return {"error": f"match-bpm failed: {e}"}
+
+    return {
+        "engine": engine,
+        "detect_engine": detect_engine,
+        "source_bpm": round(src, 3),
+        "source_bpm_detected": round(detected, 3),
+        "source_bpm_overridden": overridden,
+        "target_bpm": float(target_bpm),
+        "ratio": round(ratio, 4),
+        "input": str(input_path),
+        "output": str(outp),
+    }
 
 
 # --------------------------------------------------------------------------- #
