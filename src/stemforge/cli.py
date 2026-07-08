@@ -4,7 +4,8 @@ Examples
 --------
     stemforge doctor
     stemforge separate song.wav --model htdemucs_ft -o out/
-    stemforge run song.wav --target-bpm 120 --midi --drum-split --drum-midi --stretch
+    stemforge separate song.wav --preset sota            # BS-Roformer via audio-separator
+    stemforge run song.wav --preset max --midi --stretch --target-bpm 120
     stemforge run song.wav --set separation.segment=8 --set midi.onset_threshold=0.6
     stemforge ui
 """
@@ -17,10 +18,15 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .orchestrator import Pipeline, load_config
+from .orchestrator import Pipeline, load_config, preset_names
 
 app = typer.Typer(add_completion=False, help="StemForge — local audio workstation.")
 console = Console()
+
+_PRESET_HELP = (
+    "Quality preset: " + " | ".join(preset_names())
+    + " (overrides --model; --set separation.* still wins)."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -95,7 +101,7 @@ def doctor() -> None:
     except Exception as e:  # noqa: BLE001
         t.add_row("torch", f"[red]missing[/] ({e})")
 
-    for mod in ("demucs", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
+    for mod in ("demucs", "audio_separator", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
         try:
             __import__(mod)
             t.add_row(mod, "[green]ok[/]")
@@ -112,16 +118,21 @@ def doctor() -> None:
 def separate(
     input: Path = typer.Argument(..., exists=True, dir_okay=False, help="Audio file."),
     model: str = typer.Option("htdemucs_ft", help="htdemucs_ft | htdemucs_6s | htdemucs"),
+    preset: Optional[str] = typer.Option(None, "--preset", help=_PRESET_HELP),
     out: Path = typer.Option(Path("out"), "-o", "--out", help="Output root."),
     segment: float = typer.Option(10.0, help="VRAM control (seconds)."),
     device: str = typer.Option("auto", help="auto | cuda | cpu"),
 ) -> None:
     """Separation only (Phase 1)."""
-    cfg = load_config(overrides={
+    overrides: dict[str, object] = {
         "separation.model": model, "separation.segment": segment,
         "output.root": str(out), "device": device,
         "analysis.enabled": False,
-    })
+    }
+    if preset:  # preset picks the model; drop the --model default so it applies
+        overrides["separation.preset"] = preset
+        overrides.pop("separation.model")
+    cfg = load_config(overrides=overrides)
     manifest = Pipeline(cfg).run(input)
     _summarize(manifest)
 
@@ -147,6 +158,7 @@ def run(
     config: Optional[Path] = typer.Option(None, help="Custom YAML config."),
     out: Path = typer.Option(Path("out"), "-o", "--out"),
     model: str = typer.Option("htdemucs_ft"),
+    preset: Optional[str] = typer.Option(None, "--preset", help=_PRESET_HELP),
     target_bpm: Optional[float] = typer.Option(None, "--target-bpm"),
     midi: bool = typer.Option(False, "--midi"),
     drum_split: bool = typer.Option(False, "--drum-split"),
@@ -167,6 +179,9 @@ def run(
         "drums.midi.enabled": drum_midi,
         "stretch.enabled": stretch or target_bpm is not None,
     }
+    if preset:  # preset picks the model; drop the --model default so it applies
+        overrides["separation.preset"] = preset
+        overrides.pop("separation.model")
     if target_bpm is not None:
         overrides["stretch.target_bpm"] = target_bpm
     overrides.update(_overrides_from_sets(set_))
@@ -183,9 +198,9 @@ def ui(
     share: bool = typer.Option(False, "--share", help="Create a public Gradio link."),
 ) -> None:
     """Launch the local Gradio web app."""
-    from .app import build_ui
+    from .app import launch
 
-    build_ui().launch(server_name=host, server_port=port, share=share)
+    launch(host=host, port=port, share=share)
 
 
 if __name__ == "__main__":

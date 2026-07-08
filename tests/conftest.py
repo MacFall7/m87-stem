@@ -16,6 +16,17 @@ def sine():
 
 
 @pytest.fixture
+def sine_wav(tmp_path, sine):
+    """The `sine` fixture written to <tmp>/in.wav (FLOAT subtype)."""
+    import soundfile as sf
+
+    samples, sr = sine
+    wav = tmp_path / "in.wav"
+    sf.write(str(wav), samples.T, sr, subtype="FLOAT")
+    return wav
+
+
+@pytest.fixture
 def click_track():
     """4 s mono click track at 120 BPM (beat every 0.5 s), 44.1 kHz."""
     sr = 44100

@@ -2,7 +2,7 @@
 
 Local, GPU-accelerated audio workstation. One machine, four capabilities over a single shared analysis pass:
 
-1. **Stem separation** — full mix → `vocals / drums / bass / other` (+ `guitar / piano`)
+1. **Stem separation** — full mix → `vocals / drums / bass / other` (+ `guitar / piano`), three backends: Demucs, **BS-Roformer (SOTA)** via audio-separator, and a hybrid of both
 2. **Melodic MIDI** — each melodic stem → `.mid` (notes + pitch bends)
 3. **BPM time-stretch** — any stem → retimed to a target BPM, pitch preserved
 4. **Drum decomposition** — drum stem → `kick / snare / toms / hi-hat / ride / crash`, plus drum `.mid` (GM-mapped, velocity-aware)
@@ -40,6 +40,12 @@ pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberban
 
 > Do **not** install the `midi-tf` extra unless you accept that it pulls TensorFlow and can break the torch CUDA stack. The default `midi` path is ONNX-only.
 
+Optional — SOTA separation (BS-Roformer & the UVR model zoo, no TensorFlow, reuses torch + onnxruntime-gpu):
+
+```bash
+pip install "audio-separator[gpu]"     # or: pip install -e ".[separation-sota]"
+```
+
 ### 4. System binaries
 
 ```bash
@@ -52,6 +58,7 @@ pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberban
 
 Auto-downloaded on first use:
 - **Demucs** (`htdemucs_ft`, `htdemucs_6s`) — via the `demucs` package.
+- **BS-Roformer / UVR models** — via `audio-separator` into `models/uvr/` (presets `sota` / `max`).
 
 Manual, dropped into `models/` (see `models/README.md`):
 - **Basic Pitch ONNX** (`basic_pitch.onnx`, ~230 KB) — melodic transcription.
@@ -68,9 +75,15 @@ Manual, dropped into `models/` (see `models/README.md`):
 # Day-one deliverable: separate a track into stems
 stemforge separate song.wav --model htdemucs_ft -o out/
 
+# Quality presets (also in the UI dropdown)
+stemforge separate song.wav --preset fast   # demucs htdemucs (draft)
+stemforge separate song.wav --preset best   # demucs htdemucs_ft, shifts=2
+stemforge separate song.wav --preset sota   # BS-Roformer (vocals + instrumental)
+stemforge separate song.wav --preset max    # hybrid 4-stem: roformer vocals + demucs residual
+
 # Full pipeline
 stemforge run song.wav \
-  --model htdemucs_ft --target-bpm 120 \
+  --preset max --target-bpm 120 \
   --midi --drum-split --drum-midi --stretch -o out/
 
 # Launch the local web UI
