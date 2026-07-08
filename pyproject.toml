@@ -19,7 +19,7 @@ dependencies = [
     "soundfile>=0.12",
     "librosa>=0.10",
     "pyyaml>=6.0",
-    "typer>=0.12",
+    "typer>=0.15",       # older typer + Click 8.4 = make_metavar TypeError
     "rich>=13.0",
     "tqdm>=4.66",
     "pretty_midi>=0.2.10",
@@ -30,6 +30,10 @@ dependencies = [
 [project.optional-dependencies]
 # Stem + drum separation (needs torch installed first).
 separation = ["demucs>=4.0.1"]
+
+# SOTA separation (BS-Roformer & the UVR model zoo) via audio-separator.
+# NO TensorFlow — reuses the existing torch + onnxruntime-gpu stack.
+separation-sota = ["audio-separator[gpu]>=0.44"]
 
 # Tempo / beat / downbeat. beat_this is the primary engine (PyTorch, no numpy pin).
 # If the PyPI name resolves, great; otherwise install from git (see README).

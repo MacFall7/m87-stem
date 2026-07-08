@@ -48,16 +48,63 @@ class AnalysisCfg:
     bpm_from_regression: bool = True
 
 
+BS_ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+
 @dataclass
 class SeparationCfg:
     enabled: bool = True
+    backend: str = "demucs"  # demucs | uvr (audio-separator) | hybrid (uvr vocals + demucs residual)
+    preset: str | None = None  # fast | best | sota | max — see SEPARATION_PRESETS
     model: str = "htdemucs_ft"
+    uvr_model: str = BS_ROFORMER_MODEL
+    uvr_model_dir: str = "models/uvr"
+    uvr_use_autocast: bool = True
     stems: list[str] = field(default_factory=lambda: ["vocals", "drums", "bass", "other"])
     segment: float = 10.0
     overlap: float = 0.25
     shifts: int = 1
     export_formats: list[str] = field(default_factory=lambda: ["wav"])
     no_cuda_memory_caching: bool = False
+
+
+# Quality presets: named bundles of separation settings. load_config layers a
+# preset over the YAML values but under explicit dotted overrides, so
+# `--set separation.shifts=1` still beats `--preset max`.
+SEPARATION_PRESETS: dict[str, dict[str, Any]] = {
+    # quick draft: plain htdemucs, single pass
+    "fast": {"backend": "demucs", "model": "htdemucs", "shifts": 1},
+    # best Demucs quality: fine-tuned bag + test-time augmentation
+    "best": {"backend": "demucs", "model": "htdemucs_ft", "shifts": 2},
+    # SOTA 2-stem: BS-Roformer vocals/instrumental via audio-separator
+    "sota": {
+        "backend": "uvr",
+        "uvr_model": BS_ROFORMER_MODEL,
+        "stems": ["vocals", "instrumental"],
+    },
+    # Max 4-stem: BS-Roformer vocals + htdemucs_ft on the instrumental residual
+    "max": {
+        "backend": "hybrid",
+        "model": "htdemucs_ft",
+        "uvr_model": BS_ROFORMER_MODEL,
+        "shifts": 2,
+        "stems": ["vocals", "drums", "bass", "other"],
+    },
+}
+
+
+def preset_names() -> list[str]:
+    """Preset names in quality order (for CLI/UI choices)."""
+    return list(SEPARATION_PRESETS)
+
+
+# Optional backend deps: missing one is a fail-soft skip (with an install hint);
+# any other ModuleNotFoundError is a real error and surfaces via the stage trace.
+_SEPARATION_DEP_HINTS = {
+    "audio_separator": "pip install 'audio-separator[gpu]'",
+    "demucs": "pip install demucs",
+    "torch": "install CUDA-matched torch first (see README)",
+}
 
 
 @dataclass
@@ -144,14 +191,30 @@ def load_config(path: PathLike | None = None, overrides: dict[str, Any] | None =
     """Load default.yaml (or `path`), deep-merge `overrides`, build a RunConfig.
 
     `overrides` accepts dotted keys, e.g. {"separation.model": "htdemucs_6s"}.
+    Precedence (low to high): yaml < separation preset < dotted overrides, so
+    `--set separation.shifts=1` still wins over `--preset max`.
     """
     src = Path(path) if path else _CONFIG_DEFAULT
     data: dict[str, Any] = {}
     if src.is_file():
         data = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
-    if overrides:
-        for dotted, value in overrides.items():
-            _set_dotted(data, dotted, value)
+    overrides = dict(overrides or {})
+    preset = overrides.get("separation.preset", (data.get("separation") or {}).get("preset"))
+    if preset:
+        key = str(preset).strip().lower()
+        if key not in SEPARATION_PRESETS:
+            raise ValueError(
+                f"unknown separation preset {preset!r}; choose from {sorted(SEPARATION_PRESETS)}"
+            )
+        sep = data.get("separation") or {}
+        data["separation"] = sep
+        for name, value in SEPARATION_PRESETS[key].items():
+            sep[name] = list(value) if isinstance(value, list) else value
+        sep["preset"] = key
+        if "separation.preset" in overrides:
+            overrides["separation.preset"] = key  # normalized for the manifest
+    for dotted, value in overrides.items():
+        _set_dotted(data, dotted, value)
     return _build(RunConfig, data)
 
 
@@ -235,9 +298,11 @@ class Pipeline:
     Models are cached on the instance so a batch of files does not reload weights.
     """
 
-    def __init__(self, cfg: RunConfig):
+    def __init__(self, cfg: RunConfig, model_cache: dict[str, Any] | None = None):
         self.cfg = cfg
-        self._model_cache: dict[str, Any] = {}
+        # Keyed "<backend>:<model name>" so a shared cache (e.g. across UI runs
+        # with different presets) can never hand back the wrong weights.
+        self._model_cache: dict[str, Any] = model_cache if model_cache is not None else {}
 
     def resolve_device(self) -> str:
         if self.cfg.device != "auto":
@@ -322,21 +387,95 @@ class Pipeline:
         ctx.manifest["analysis"] = grid.to_dict()
 
     def _run_separation(self, ctx: RunContext) -> None:
-        from . import separate
+        cfg = self.cfg.separation
+        backend = (cfg.backend or "demucs").strip().lower()
+        models_used: dict[str, str] = {}
+        notes: list[str] = []
+        try:
+            if backend == "demucs":
+                stems = self._separate_demucs(ctx, cfg, models_used)
+            elif backend == "uvr":
+                stems = self._separate_uvr(ctx, cfg, models_used)
+            elif backend == "hybrid":
+                stems = self._separate_hybrid(ctx, cfg, models_used, notes)
+            else:
+                raise ValueError(f"unknown separation backend {cfg.backend!r} (demucs | uvr | hybrid)")
+        except ModuleNotFoundError as e:
+            root = (e.name or "").split(".")[0]
+            hint = _SEPARATION_DEP_HINTS.get(root)
+            if hint is None:  # not an optional backend dep -> real bug, let _stage record it
+                raise
+            ctx.manifest["separation"] = {"skipped": f"missing dependency {root!r} ({hint})"}
+            return
 
-        model = self._model_cache.get("demucs")
-        stems, model = separate.separate(ctx.audio, self.cfg.separation, device=ctx.device, model=model)
-        self._model_cache["demucs"] = model
         stems_dir = ctx.subdir("stems")
         written: dict[str, str] = {}
         for name, tensor in stems.items():
-            for fmt in self.cfg.separation.export_formats:
+            for fmt in cfg.export_formats:
                 path = save_audio(stems_dir / f"{name}.{fmt}", tensor)
                 if fmt == "wav":
                     ctx.stems[name] = path
                 written[f"{name}.{fmt}"] = str(path)
-        ctx.manifest["separation"] = {"model": self.cfg.separation.model, "files": written}
-        ctx.manifest["models"]["demucs"] = self.cfg.separation.model
+        ctx.manifest["separation"] = {
+            "backend": backend,
+            "preset": cfg.preset,
+            "model": " + ".join(models_used.values()),
+            "models": models_used,
+            "files": written,
+        }
+        if notes:
+            ctx.manifest["separation"]["notes"] = notes
+        ctx.manifest["models"].update(models_used)
+
+    def _separate_demucs(
+        self, ctx: RunContext, cfg: SeparationCfg, models_used: dict[str, str],
+        audio: AudioTensor | None = None, stems_subset: list[str] | None = None,
+    ) -> dict[str, AudioTensor]:
+        from . import separate
+
+        dcfg = cfg if stems_subset is None else dataclasses.replace(cfg, stems=stems_subset)
+        cache_key = f"demucs:{cfg.model}"
+        stems, model = separate.separate(
+            ctx.audio if audio is None else audio, dcfg,
+            device=ctx.device, model=self._model_cache.get(cache_key),
+        )
+        self._model_cache[cache_key] = model
+        models_used["demucs"] = cfg.model
+        return stems
+
+    def _separate_uvr(
+        self, ctx: RunContext, cfg: SeparationCfg, models_used: dict[str, str],
+    ) -> dict[str, AudioTensor]:
+        from . import separate_uvr
+
+        cache_key = f"uvr:{cfg.uvr_model}"
+        stems, engine = separate_uvr.separate(
+            ctx.audio, cfg, device=ctx.device, engine=self._model_cache.get(cache_key),
+        )
+        self._model_cache[cache_key] = engine
+        models_used["uvr"] = cfg.uvr_model
+        return stems
+
+    def _separate_hybrid(
+        self, ctx: RunContext, cfg: SeparationCfg, models_used: dict[str, str], notes: list[str],
+    ) -> dict[str, AudioTensor]:
+        """BS-Roformer vocals + demucs on the instrumental residual, merged 4-stem."""
+        uvr_stems = self._separate_uvr(ctx, cfg, models_used)
+        instrumental = uvr_stems.get("instrumental")
+        if instrumental is None:  # 4-stem UVR model: nothing left to refine
+            notes.append("uvr model produced no instrumental stem; demucs refinement skipped")
+            return uvr_stems
+        try:
+            residual = self._separate_demucs(
+                ctx, cfg, models_used, audio=instrumental, stems_subset=["drums", "bass", "other"],
+            )
+        except ModuleNotFoundError as e:
+            # don't discard the finished roformer pass just because demucs is absent
+            notes.append(f"demucs unavailable ({e.name}); kept the 2-stem uvr result")
+            return uvr_stems
+        merged = {k: v for k, v in uvr_stems.items() if k != "instrumental"}
+        merged.update({k: v for k, v in residual.items() if k != "vocals"})
+        return merged
 
     def _run_midi(self, ctx: RunContext) -> None:
         from . import midi_melodic
