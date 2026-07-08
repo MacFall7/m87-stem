@@ -46,45 +46,56 @@ def separate(
     Returns ``(stems, model)`` — the model is returned so the caller can cache it
     across a batch without reloading weights.
     """
-    import torch
-    from demucs.apply import apply_model
-
     if cfg.no_cuda_memory_caching:
         os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
 
     if model is None:
         model = load_model(cfg.model, device)
 
+    sources = apply_model_to_audio(
+        model, audio, device=device, shifts=cfg.shifts,
+        overlap=cfg.overlap, segment=cfg.segment,
+    )
+    return _select(sources, cfg), model
+
+
+def apply_model_to_audio(
+    model: Any, audio: AudioTensor, device: str = "cuda",
+    shifts: int = 1, overlap: float = 0.25, segment: float = 10.0,
+) -> dict[str, AudioTensor]:
+    """Apply a loaded Demucs model to ``audio``; return ``{source: AudioTensor}``.
+
+    Shared by the stem backend and the inagoy drum backend — both are Demucs
+    checkpoints, so both use the same per-track normalization + apply path.
+    """
+    import torch
+    from demucs.apply import apply_model
+
     # Demucs models are 44.1 kHz stereo natively; ingest already guarantees that,
     # but convert defensively in case a caller passes something else.
     wav = _prepare(audio, model, device)
-
-    _apply_segment(model, cfg.segment)
+    _apply_segment(model, segment)
 
     # Per-track normalization (mirrors demucs.separate).
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
     with torch.no_grad():
-        out = _apply(apply_model, model, wav, cfg, device)
+        out = _apply(apply_model, model, wav, shifts, overlap, segment, device)
 
     out = out * ref.std() + ref.mean()  # (sources, channels, samples)
-
-    sources: dict[str, AudioTensor] = {}
-    for name, src in zip(model.sources, out):
-        sources[name] = AudioTensor.from_torch(src, model.samplerate)
+    sources = {name: AudioTensor.from_torch(src, model.samplerate)
+               for name, src in zip(model.sources, out)}
 
     if device == "cuda":
         torch.cuda.empty_cache()
-
-    return _select(sources, cfg), model
+    return sources
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _prepare(audio: AudioTensor, model, device):
-    import torch
     from demucs.audio import convert_audio
 
     wav = audio.torch().to(device)  # (channels, samples)
@@ -92,11 +103,11 @@ def _prepare(audio: AudioTensor, model, device):
     return wav
 
 
-def _apply(apply_model, model, wav, cfg, device):
+def _apply(apply_model, model, wav, shifts, overlap, segment, device):
     """Call apply_model, tolerating signature differences across demucs 4.x."""
-    kwargs = dict(shifts=cfg.shifts, split=True, overlap=cfg.overlap, progress=False, device=device)
+    kwargs = dict(shifts=shifts, split=True, overlap=overlap, progress=False, device=device)
     try:
-        return apply_model(model, wav[None], segment=cfg.segment, **kwargs)[0]
+        return apply_model(model, wav[None], segment=segment, **kwargs)[0]
     except TypeError:
         # older/newer signature without a segment kwarg (set on model instead)
         return apply_model(model, wav[None], **kwargs)[0]

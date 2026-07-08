@@ -100,8 +100,11 @@ def fake_drum_cli(monkeypatch):
 
 
 def _drum_cfg(**over):
+    """A drums.split cfg forced to the (optional) uvr backend for these tests."""
     cfg = load_config().drums.split
     cfg.enabled = True
+    cfg.backend = "uvr"
+    cfg.parts = ["kick", "snare", "toms", "hihat", "ride", "crash"]  # full-kit UVR request
     for k, v in over.items():
         setattr(cfg, k, v)
     return cfg
@@ -194,10 +197,7 @@ def test_cli_crash_is_error_not_skip(monkeypatch, tmp_path):
     assert "error" in res and "CUDA OOM" in res["error"]
 
 
-# --------------------------------------------------------------------------- #
-# End-to-end: raw drum loop -> hit stems + GM drum MIDI
-# --------------------------------------------------------------------------- #
-def test_pipeline_drum_loop_to_stems_and_midi(fake_drum_cli, tmp_path):
+def test_pipeline_drum_loop_to_stems_and_midi_uvr(fake_drum_cli, tmp_path):
     loop = _click_loop()
     wav = tmp_path / "break.wav"
     sf.write(str(wav), loop.samples.T, loop.sample_rate, subtype="FLOAT")
@@ -207,6 +207,8 @@ def test_pipeline_drum_loop_to_stems_and_midi(fake_drum_cli, tmp_path):
         "analysis.enabled": False,
         "separation.enabled": False,     # a raw drum loop: no upstream separation
         "drums.split.enabled": True,
+        "drums.split.backend": "uvr",
+        "drums.split.parts": ["kick", "snare", "toms", "hihat", "ride", "crash"],
         "drums.split.from_input": True,  # tear down the input loop itself
         "drums.midi.enabled": True,
         "output.root": str(tmp_path / "out"),
@@ -223,3 +225,134 @@ def test_pipeline_drum_loop_to_stems_and_midi(fake_drum_cli, tmp_path):
     assert dm["source"] == "parts"
     assert dm["note_count"] > 0
     assert (drums_dir / "drums.mid").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# inagoy/drumsep backend (default) — main-env Demucs, mocked (no download/apply)
+# --------------------------------------------------------------------------- #
+class _FakeDemucs:
+    sources = ["bombo", "redoblante", "toms", "platillos"]  # kick/snare/toms/cymbals (ES labels)
+    samplerate = 44100
+
+    def to(self, _d):
+        return self
+
+    def eval(self):
+        return self
+
+
+@pytest.fixture
+def fake_inagoy(monkeypatch):
+    """inagoy checkpoint 'loads' without download; apply returns 4 named sources."""
+    monkeypatch.setattr(
+        drum_split, "_load_inagoy_model", lambda cfg, device: (_FakeDemucs(), "drumsep.th"),
+    )
+
+    def fake_apply(model, audio, device="cuda", **kw):
+        return {name: audio for name in model.sources}
+
+    import stemforge.separate as sep
+    monkeypatch.setattr(sep, "apply_model_to_audio", fake_apply)
+
+
+def _inagoy_cfg(**over):
+    cfg = load_config().drums.split       # backend defaults to demucs_inagoy
+    cfg.enabled = True
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def test_inagoy_maps_spanish_sources_to_canonical(fake_inagoy, tmp_path):
+    res = drum_split.split(None, _inagoy_cfg(), tmp_path, audio=_click_loop())
+    assert res["backend"] == "demucs_inagoy"
+    assert res["model"] == "drumsep.th"
+    assert set(res["files"]) == {"kick", "snare", "toms", "other"}
+    for p in res["files"].values():
+        assert Path(p).is_file()
+
+
+def test_inagoy_download_failure_fails_soft(monkeypatch, tmp_path):
+    def boom(cfg):
+        raise drum_split._DrumModelUnavailable("could not download inagoy drumsep model (offline)")
+
+    monkeypatch.setattr(drum_split, "_ensure_inagoy_checkpoint", boom)
+    res = drum_split.split(None, _inagoy_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "inagoy" in res["skipped"].lower()
+    assert res["backend"] == "demucs_inagoy"
+
+
+def test_inagoy_bad_checkpoint_fails_soft(monkeypatch, tmp_path):
+    """A checkpoint that downloads but won't load -> skip (not a crash)."""
+    dest = tmp_path / "drumsep.th"
+    dest.write_bytes(b"not a real checkpoint")
+    monkeypatch.setattr(drum_split, "_ensure_inagoy_checkpoint", lambda cfg: dest)
+
+    import types
+    fake_demucs = types.ModuleType("demucs")
+    fake_states = types.ModuleType("demucs.states")
+
+    def boom(_p):
+        raise RuntimeError("bad magic")
+
+    fake_states.load_model = boom
+    monkeypatch.setitem(__import__("sys").modules, "demucs", fake_demucs)
+    monkeypatch.setitem(__import__("sys").modules, "demucs.states", fake_states)
+
+    res = drum_split.split(None, _inagoy_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "load" in res["skipped"].lower()
+
+
+def test_inagoy_missing_demucs_fails_soft(monkeypatch, tmp_path):
+    monkeypatch.setattr(drum_split, "_ensure_inagoy_checkpoint", lambda cfg: tmp_path / "drumsep.th")
+
+    def no_demucs(cfg, device):
+        raise ModuleNotFoundError("No module named 'demucs'", name="demucs")
+
+    monkeypatch.setattr(drum_split, "_load_inagoy_model", no_demucs)
+    res = drum_split.split(None, _inagoy_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "demucs" in res["skipped"]
+
+
+def test_inagoy_checkpoint_download_and_cache(monkeypatch, tmp_path):
+    """Downloads once into inagoy_model_dir; reuses the cached file next time."""
+    calls = {"n": 0}
+
+    def fake_urlretrieve(url, dest):
+        calls["n"] += 1
+        Path(dest).write_bytes(b"fake-checkpoint")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    cfg = _inagoy_cfg(inagoy_model_dir=str(tmp_path / "dr"),
+                      inagoy_url="http://example.test/drumsep.th")
+
+    p1 = drum_split._ensure_inagoy_checkpoint(cfg)
+    p2 = drum_split._ensure_inagoy_checkpoint(cfg)
+    assert p1 == p2 and p1.is_file() and p1.name == "drumsep.th"
+    assert calls["n"] == 1  # second call hits the cache
+
+
+def test_pipeline_drum_loop_inagoy_to_stems_and_midi(fake_inagoy, tmp_path):
+    loop = _click_loop()
+    wav = tmp_path / "break.wav"
+    sf.write(str(wav), loop.samples.T, loop.sample_rate, subtype="FLOAT")
+
+    cfg = load_config(overrides={
+        "ingest.normalize": "none",
+        "analysis.enabled": False,
+        "separation.enabled": False,
+        "drums.split.enabled": True,      # backend defaults to demucs_inagoy
+        "drums.split.from_input": True,
+        "drums.midi.enabled": True,
+        "output.root": str(tmp_path / "out"),
+    })
+    m = Pipeline(cfg).run(wav)
+
+    ds = m["drum_split"]
+    assert ds["backend"] == "demucs_inagoy"
+    assert set(ds["files"]) == {"kick", "snare", "toms", "other"}
+    dm = m["drum_midi"]
+    assert dm["source"] == "parts"
+    assert dm["note_count"] > 0
+    assert (tmp_path / "out" / "break" / "drums" / "drums.mid").is_file()

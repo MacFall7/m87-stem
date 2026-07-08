@@ -5,7 +5,7 @@ Local, GPU-accelerated audio workstation. One machine, four capabilities over a 
 1. **Stem separation** — full mix → `vocals / drums / bass / other` (+ `guitar / piano`), three backends: Demucs, **BS-Roformer (SOTA)** via audio-separator, and a hybrid of both
 2. **Melodic MIDI** — each melodic stem → `.mid` (notes + pitch bends)
 3. **BPM time-stretch** — any stem → retimed to a target BPM, pitch preserved
-4. **Drum teardown** — a drum loop *or* the drums stem → `kick / snare / toms / hi-hat / ride / crash` hit stems + a GM drum `.mid` (velocity-aware), via a DrumSep model in the isolated `.venv-uvr`
+4. **Drum teardown** — a drum loop *or* the drums stem → `kick / snare / toms / other` hit stems + a GM drum `.mid` (velocity-aware), via the inagoy/drumsep Demucs model in the main env
 
 One analysis pass produces the tempo map + beat grid **once**; every downstream module consumes it, so all outputs stay phase- and grid-aligned.
 
@@ -35,7 +35,7 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"   # must pri
 ### 3. Install StemForge + conflict-free extras
 
 ```bash
-pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberband, python-stretch, gradio
+pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberband, python-stretch, fastapi+uvicorn
 ```
 
 > Do **not** install the `midi-tf` extra unless you accept that it pulls TensorFlow and can break the torch CUDA stack. The default `midi` path is ONNX-only.
@@ -68,7 +68,7 @@ ran on CPU) and verifies `torch.cuda.is_available()` inside the venv.
 Auto-downloaded on first use:
 - **Demucs** (`htdemucs_ft`, `htdemucs_6s`) — via the `demucs` package.
 - **BS-Roformer / UVR models** — via `audio-separator` into `models/uvr/` (presets `sota` / `max`).
-- **DrumSep** — the drum-teardown model, also via `audio-separator` in `.venv-uvr` (auto-discovered with `--list_filter=drums`, or pin `drums.split.uvr_model`).
+- **inagoy/drumsep** — the drum-teardown model (a Demucs checkpoint), auto-downloaded to `models/drumsep/` on first use (`drums.split.inagoy_url` / `inagoy_model_dir`).
 
 Manual, dropped into `models/` (see `models/README.md`):
 - **Basic Pitch ONNX** (`basic_pitch.onnx`, ~230 KB) — melodic transcription.
@@ -107,13 +107,19 @@ stemforge ui --no-open       # start it without opening a browser
 stemforge desktop-shortcut   # create a double-clickable Desktop launcher
 ```
 
-The web UI is the **M87 Space-Tech workstation** — a dark, workflow-first
-console with four panels:
+The web UI is the **M87 workstation** — a bespoke local web app (a FastAPI
+backend + a custom single-page front-end served by uvicorn; no Gradio). A dark,
+deep-space console with a left workflow rail and four panels, no page reloads:
 
-- **Extract Stems** — a mix → stems at a quality preset (Fast/Best/SOTA/Max), audition each stem, download individually or all.
+- **Extract Stems** — a mix → stems at a quality preset (Fast/Best/SOTA/Max), audition each stem on a real waveform, download individually or all.
 - **Drum Teardown** — drop a drum loop (or a drums stem) → per-hit stems + a GM drum `.mid`; preview each hit.
 - **Melodic → MIDI** — a stem or a mix → `.mid`, with monophonic and quantize-to-grid toggles.
 - **Full Teardown** — one drop → stems + drum hits + MIDI + tempo, a grid-aligned bundle with `manifest.json`.
+
+Every input and result gets a wavesurfer.js waveform with play/solo/download; a
+BPM chip, download-all, and open-folder are one click. All theme colors/fonts are
+CSS variables at the top of `web/assets/styles.css` — swap in exact M87 tokens
+without touching the rest of the stylesheet.
 
 `stemforge desktop-shortcut` drops a native launcher on your Desktop — a `.lnk`
 on Windows, a `.command` on macOS, a `.desktop` entry on Linux. Double-click it
@@ -128,7 +134,7 @@ Every run writes a per-song bundle:
 out/<song>/
 ├─ stems/       vocals.wav drums.wav bass.wav other.wav [guitar.wav piano.wav]
 ├─ midi/        bass.mid other.mid ...
-├─ drums/       kick.wav snare.wav toms.wav hihat.wav ride.wav crash.wav  +  drums.mid
+├─ drums/       kick.wav snare.wav toms.wav other.wav  +  drums.mid
 ├─ stretched/   <stem>_<bpm>bpm.wav
 └─ manifest.json   source/target BPM, beat grid, model versions, per-stem ratios
 ```
@@ -143,7 +149,7 @@ out/<song>/
 | 1 | Demucs separation | ✅ working |
 | 2 | analysis (beat_this/librosa) + Rubber Band stretch | ✅ working |
 | 3 | melodic MIDI (Basic Pitch ONNX) | 🟡 interface complete; drop in `basic_pitch.onnx` |
-| 4 | drum teardown (DrumSep via isolated `.venv-uvr`) | ✅ working — loop/stem → hit stems |
+| 4 | drum teardown (inagoy/drumsep Demucs, main env) | ✅ working — loop/stem → hit stems |
 | 5 | drum MIDI (parts-based, GM + velocity) | ✅ working — loop → GM `.mid` (ADTOF path optional) |
 | 6 | orchestrator + M87 workstation UI | ✅ working |
 | 7 | hardening / golden-file tests | 🟡 in progress |
@@ -162,9 +168,11 @@ stemforge/
 ├─ configs/default.yaml       # every knob, maps to RunConfig
 ├─ models/                    # downloaded weights (git-ignored)
 ├─ src/stemforge/
-│  ├─ ingest.py  analysis.py  separate.py  midi_melodic.py
-│  ├─ drum_split.py  drum_midi.py  stretch.py
-│  ├─ orchestrator.py  io_utils.py  cli.py  app.py
+│  ├─ ingest.py  analysis.py  separate.py  separate_uvr.py  midi_melodic.py
+│  ├─ drum_split.py  drum_midi.py  stretch.py  desktop.py
+│  ├─ orchestrator.py  io_utils.py  cli.py
+│  ├─ webapp.py               # FastAPI backend (the M87 workstation)
+│  └─ web/                    # static SPA: index.html + assets/{styles.css,app.js}
 └─ tests/
 ```
 

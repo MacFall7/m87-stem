@@ -102,7 +102,7 @@ def doctor() -> None:
     except Exception as e:  # noqa: BLE001
         t.add_row("torch", f"[red]missing[/] ({e})")
 
-    for mod in ("demucs", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
+    for mod in ("demucs", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "fastapi", "uvicorn"):
         try:
             __import__(mod)
             t.add_row(mod, "[green]ok[/]")
@@ -235,15 +235,15 @@ def run(
 def ui(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(7860),
-    share: bool = typer.Option(False, "--share", help="Create a public Gradio link."),
     open_browser: bool = typer.Option(
         True, "--open/--no-open", help="Open the app in a browser once the server is up."
     ),
 ) -> None:
-    """Launch the local Gradio web app."""
-    from .app import launch
+    """Launch the M87 workstation (bespoke FastAPI web app, served by uvicorn)."""
+    from .webapp import launch
 
-    launch(host=host, port=port, share=share, open_browser=open_browser)
+    console.print(f"[green]M87 · StemForge[/] → http://{host}:{port}/")
+    launch(host=host, port=port, open_browser=open_browser)
 
 
 @app.command("desktop-shortcut")

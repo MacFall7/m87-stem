@@ -15,6 +15,8 @@ models/*.pt
 models/*.th
 models/*.ckpt
 models/**/*.bin
+models/drumsep/     # inagoy/drumsep checkpoint cache
+models/uvr/         # audio-separator model cache
 
 # Run outputs
 out/

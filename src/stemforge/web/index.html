@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>M87 · StemForge</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/7.8.6/wavesurfer.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="app">
+    <!-- LEFT WORKFLOW RAIL -->
+    <aside class="rail">
+      <div class="brand">
+        <span class="logo-mark" aria-hidden="true"></span>
+        <span class="brand-name">M87<span class="brand-sub">STEMFORGE</span></span>
+      </div>
+
+      <nav class="rail-nav" id="rail-nav"><!-- workflow items injected --></nav>
+
+      <div class="rail-foot">
+        <div class="chip" id="chip-device"><span class="dot"></span><span>device …</span></div>
+        <div class="chip" id="chip-model"><span class="dot"></span><span>models …</span></div>
+      </div>
+    </aside>
+
+    <!-- MAIN AREA -->
+    <main class="main">
+      <header class="main-head">
+        <div>
+          <h1 id="wf-title">Extract Stems</h1>
+          <p class="mono-sub" id="wf-sub">Full mix → isolated stems</p>
+        </div>
+        <div class="head-meta" id="head-meta" hidden>
+          <span class="meta-chip" id="chip-bpm">— BPM</span>
+          <span class="meta-chip" id="chip-key">key —</span>
+        </div>
+      </header>
+
+      <section class="panel">
+        <!-- DROPZONE -->
+        <div class="dropzone" id="dropzone" tabindex="0">
+          <input type="file" id="file-input" accept="audio/*" hidden />
+          <div class="dz-inner">
+            <span class="dz-icon" aria-hidden="true"></span>
+            <div class="dz-copy">
+              <strong id="dz-title">Drop a track</strong>
+              <span class="mono-sub" id="dz-hint">or click to browse · WAV / MP3 / FLAC</span>
+            </div>
+          </div>
+          <div class="dz-wave" id="input-wave" hidden></div>
+          <div class="dz-file mono-sub" id="dz-file" hidden></div>
+        </div>
+
+        <!-- CONTROLS -->
+        <div class="controls">
+          <div class="ctrl" id="ctrl-quality">
+            <label class="mono-label">Quality</label>
+            <div class="segmented" id="quality"><!-- pills injected --></div>
+          </div>
+          <div class="ctrl toggles" id="ctrl-melodic" hidden>
+            <label class="switch"><input type="checkbox" id="opt-mono" /><span>Monophonic</span></label>
+            <label class="switch"><input type="checkbox" id="opt-quant" /><span>Quantize to grid</span></label>
+          </div>
+          <button class="cta" id="run-btn" disabled>Extract Stems</button>
+        </div>
+
+        <!-- PROGRESS -->
+        <div class="progress" id="progress" hidden>
+          <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+          <span class="mono-sub" id="progress-msg">Working…</span>
+        </div>
+      </section>
+
+      <!-- RESULTS -->
+      <section class="results" id="results" hidden>
+        <div class="results-head">
+          <h2 id="results-title">Results</h2>
+          <div class="results-actions">
+            <button class="btn" id="download-all">Download all</button>
+            <button class="btn" id="open-folder">Open folder</button>
+          </div>
+        </div>
+        <div class="cards" id="cards"><!-- result cards injected --></div>
+        <p class="mono-sub status-line" id="status-line"></p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

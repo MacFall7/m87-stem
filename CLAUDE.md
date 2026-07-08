@@ -2,7 +2,8 @@
 
 StemForge is a **working local audio workstation**, verified end-to-end on an RTX 4090:
 Demucs separation, beat_this analysis, Basic Pitch → MIDI via ONNX (no TensorFlow),
-Rubber Band stretch, a Typer CLI, and a Gradio UI.
+Rubber Band stretch, real drum teardown (inagoy/drumsep), a Typer CLI, and a
+bespoke **FastAPI web app** (the M87 workstation — Gradio has been retired).
 
 ## Architecture (read these first)
 
@@ -20,19 +21,25 @@ Rubber Band stretch, a Typer CLI, and a Gradio UI.
   venv** (`.venv-uvr`) — never imported in-process. Same `(stems, engine)`
   contract. Also hosts `separate_drums()` + drum-model discovery
   (`--list_filter=drums`), reused by the drum splitter.
-- `src/stemforge/drum_split.py` — drum teardown. `backend: uvr` runs a DrumSep
-  model through the **same** `.venv-uvr` subprocess (`separate_uvr.separate_drums`);
-  accepts a raw drum LOOP (`from_input`) or the separated drums stem; parts feed
-  the existing parts-based `drum_midi` (onset + RMS-velocity + GM mapping).
+- `src/stemforge/drum_split.py` — drum teardown. Default `backend:
+  demucs_inagoy` runs the **inagoy/drumsep Demucs checkpoint in the MAIN env**
+  (via `demucs`, no venv, GPU-fast), auto-downloaded to `models/drumsep/`,
+  splitting a loop/stem into kick/snare/toms/other. `backend: uvr` (isolated
+  `.venv-uvr`) is kept but is NOT the default — audio-separator's registry has
+  no per-hit drum model. Accepts a raw drum LOOP (`from_input`); parts feed the
+  existing parts-based `drum_midi` (onset + RMS-velocity + GM mapping).
 - `src/stemforge/cli.py` — Typer CLI (`doctor|setup-sota|separate|analyze|run|ui|desktop-shortcut`).
-- `src/stemforge/app.py` — the **M87 Space-Tech workstation** (Gradio): four
-  workflow panels (Extract Stems / Drum Teardown / Melodic → MIDI / Full
-  Teardown), a dark CSS theme whose colors/fonts are CSS variables at the top of
-  `M87_CSS` (`--m87-bg` … `--m87-mono`), progress, per-stem audition, and an
-  open-output-folder button. Theme + CSS pass via `launch()` on Gradio 6.
-- `tests/` — **GPU-free**; every heavy dep is mocked. The audio-separator CLI
-  subprocess (stem + drum) is mocked in `tests/test_separation_backends.py` /
-  `tests/test_drum_split.py`; synthetic audio from `conftest.py`.
+- `src/stemforge/webapp.py` + `src/stemforge/web/` — the **M87 workstation**: a
+  FastAPI backend (job-based; `/api/{extract,drum-teardown,melodic-midi,full-teardown}`,
+  poll `/api/job/{id}` or SSE `/api/progress/{id}`, `/api/file`, `/api/download-all`,
+  `/api/open-folder`, `/api/health`) serving a static single-page front-end
+  (`web/index.html` + `web/assets/{styles.css,app.js}`, wavesurfer.js from cdnjs).
+  All colors/fonts are CSS variables at the top of `styles.css` (`--bg`, `--cyan`,
+  `--violet`, `--grad-primary`, …). Launched by `stemforge ui` (uvicorn).
+- `tests/` — **GPU-free**; every heavy dep is mocked. The FastAPI routes run with
+  the Pipeline mocked (`tests/test_webapp.py`); the drum backends mock demucs /
+  the audio-separator CLI (`tests/test_drum_split.py`); synthetic audio from
+  `conftest.py`.
 
 ## Separation backends & quality presets
 
@@ -98,27 +105,33 @@ Backend semantics worth knowing:
   cwd) so neither the venv nor the checkpoint cache is duplicated per working
   directory; `UvrEngine` removes its scratch dir via `weakref.finalize`.
 
-## Drum teardown (same isolated venv — do not regress)
+## Drum teardown (default: inagoy/drumsep in the MAIN env)
 
-`drums.split.backend = uvr` (default) tears a **drum loop** or the separated
-drums stem into hit parts through the **same** `.venv-uvr` subprocess runner —
-`separate_uvr.separate_drums()` builds a `UvrEngine.from_cfg(drum_cfg, model=…)`
-and runs it exactly like stem separation. audio-separator is still never
-imported in-process.
+**Why not audio-separator:** its model registry has NO per-hit drum model —
+`--list_filter=drums` only lists kit-isolation models. So the drum teardown uses
+the **inagoy/drumsep Demucs checkpoint** run in the MAIN env via the already-
+installed `demucs` package (it's a Demucs checkpoint — no venv, GPU-fast).
 
-- Model: `drums.split.uvr_model` when set, else **auto-discovered** via
-  `audio-separator --list_filter=drums` (`discover_drum_model`, prefers a
-  6-piece kit). Output tokens `(Kick)/(Snare)/(Toms)/(HiHat)/(Ride)/(Crash)` map
-  to canonical parts through `separate_uvr.canonical_drum_part()`.
-- Input: `drums.split.from_input=true` tears down the **raw input loop** (no
-  separation needed); otherwise it uses `ctx.stems["drums"]`. The orchestrator
-  passes `ctx.audio` as an `AudioTensor` for the from-input case.
-- The produced parts feed the existing parts-based `drum_midi` (onset detection +
-  RMS→velocity + GM note mapping, 5→7 hi-hat expansion), so a drum loop yields
-  **both** individual hit stems **and** a GM drum `.mid`.
-- Fail-soft: missing venv/ffmpeg/**drum model** → manifest `skipped` with a
-  `stemforge setup-sota` hint; a nonzero CLI exit → `error` (stderr tail). Never
-  crashes, never touches the main env.
+`drums.split.backend = demucs_inagoy` (default) — `drum_split._demucs_inagoy_split`:
+- **Checkpoint**: auto-downloaded on first use to `drums.split.inagoy_model_dir`
+  (`models/drumsep/`, git-ignored) from `drums.split.inagoy_url` (overridable).
+  Loaded with `demucs.states.load_model` and applied via the shared
+  `separate.apply_model_to_audio` (same normalization as stem separation).
+- **Mapping**: the model's 4 sources → canonical kick/snare/toms/other by
+  keyword (English or Spanish labels), with a positional kit-order fallback so
+  nothing is dropped (`_map_inagoy_sources`).
+- **Input**: `drums.split.from_input=true` tears down the raw input loop;
+  otherwise it uses `ctx.stems["drums"]`. The orchestrator passes `ctx.audio` as
+  an `AudioTensor` for the from-input case.
+- The produced parts feed the parts-based `drum_midi` (onset + RMS→velocity + GM,
+  5→7 hi-hat expansion), so a loop yields **both** hit stems **and** a GM `.mid`.
+- **Fail-soft**: a checkpoint that can't download/load, or missing demucs, →
+  manifest `skipped` with a fix hint; a runtime apply failure → `error`. Never
+  crashes, never mutates anything.
+
+`backend: uvr` still exists (isolated `.venv-uvr`, `separate_uvr.separate_drums`,
+`--list_filter=drums` discovery) but is not the default and produces kit
+isolation, not per-hit stems.
 
 ## Verified install recipe (order matters)
 
@@ -128,7 +141,7 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 python -c "import torch; print(torch.cuda.is_available())"   # must print True
 
 # 2. StemForge + conflict-free extras
-pip install -e .[all]        # demucs, beat_this, onnxruntime-gpu, pyrubberband, gradio
+pip install -e .[all]        # demucs, beat_this, onnxruntime-gpu, pyrubberband, fastapi+uvicorn
 
 # 3. Melodic MIDI, TensorFlow-free (basic-pitch's deps would pull TF):
 pip install --no-deps basic-pitch
@@ -143,14 +156,18 @@ stemforge setup-sota      # .venv-uvr: CUDA torch + audio-separator[gpu], cu124 
 
 ## Launch the app
 
-- The UI is the **M87 Space-Tech workstation** (`app.py`): four workflow panels
-  (Extract Stems · Drum Teardown · Melodic → MIDI · Full Teardown), not a
-  checkbox grid. Colors/fonts are CSS variables at the top of `M87_CSS`
-  (`--m87-bg`, `--m87-surface`, `--m87-accent`, `--m87-accent-2`, `--m87-text`,
-  `--m87-mono`) — swap them for real M87 tokens. Theme + CSS pass via `launch()`
-  on Gradio 6 (`build_ui(theme=, css=)` on 4/5).
-- **CLI:** `stemforge ui` starts Gradio and (by default) opens the browser via
-  gradio's `inbrowser=True`; `--no-open` suppresses it (`app.launch(open_browser=…)`).
+- The UI is the **M87 workstation** — a bespoke FastAPI backend (`webapp.py`)
+  serving a static SPA (`web/`), **not Gradio** (retired). One page, four
+  workflows via a left rail (Extract Stems · Drum Teardown · Melodic → MIDI ·
+  Full Teardown), no page reloads. Deep-space theme; all colors/fonts are CSS
+  variables at the top of `web/assets/styles.css` (`--bg`, `--surface`, `--cyan`,
+  `--violet`, `--indigo`, `--grad-primary`, `--text`, `--font-mono`, …) — swap
+  them for exact M87 tokens. Real waveforms via wavesurfer.js (cdnjs).
+- **CLI:** `stemforge ui` runs uvicorn and (by default) opens the browser once
+  the server is up; `--no-open` suppresses it (`webapp.launch(open_browser=…)`).
+- Progress: each POST starts a background job; the SPA polls `/api/job/{id}`
+  (SSE stream also at `/api/progress/{id}`). The Pipeline's `on_stage` hook feeds
+  coarse per-stage progress. `web/` ships as setuptools `package-data`.
 - **Double-click:** `stemforge desktop-shortcut` drops a Desktop launcher —
   a `.lnk` on Windows (PowerShell `WScript.Shell.CreateShortcut`), `.command`
   on macOS, `.desktop` on Linux (`src/stemforge/desktop.py`). It points at the
@@ -161,34 +178,42 @@ stemforge setup-sota      # .venv-uvr: CUDA torch + audio-separator[gpu], cu124 
 
 ## Gotchas (hard-won — do not regress)
 
-- **(a)** NO `from __future__ import annotations` in `cli.py` — it breaks Typer
-  bool flags and dataclass-from-dict building (annotation strings don't resolve).
-  Other modules may use it; `cli.py` may not.
+- **(a)** NO `from __future__ import annotations` in `cli.py` **or `webapp.py`** —
+  it breaks Typer bool flags / dataclass-from-dict in the CLI, and FastAPI's
+  request-time resolution of route param annotations (`UploadFile`/`Form`) in
+  the web app (stringized annotations raise `PydanticUserError`). Other modules
+  may use it; these two may not.
 - **(b)** Every Typer **bool** option needs an explicit flag name, e.g.
   `typer.Option(False, "--midi")` — otherwise Typer/Click flag inference breaks.
 - **(c)** Require `typer>=0.15` — older typer + Click 8.4 raises
   `make_metavar() TypeError`.
-- **(d)** Keep `torch` / `demucs` / `onnxruntime` / `gradio` **lazily imported**
-  (inside functions), so `import stemforge` and pytest stay GPU-free.
-  `audio_separator` is stricter still: **never imported in this process at
-  all** — subprocess only (see the isolation section above for the
-  CPU-torch/numpy clobber that rule prevents).
+- **(d)** Keep `torch` / `demucs` / `onnxruntime` / `fastapi` / `uvicorn`
+  **lazily imported** (inside functions), so `import stemforge` and pytest stay
+  GPU-free and dependency-light. `audio_separator` is stricter still: **never
+  imported in this process at all** — subprocess only (see the isolation section
+  above for the CPU-torch/numpy clobber that rule prevents).
 - **(e)** Pipeline stages stay **fail-soft**: a missing model/dependency records
-  `{"skipped": ...}` in the manifest (e.g. uvr backend without the `.venv-uvr`
-  env set up, or ffmpeg off PATH) — never crash the run, never mutate the main env.
+  `{"skipped": ...}` in the manifest (e.g. the inagoy checkpoint can't download,
+  or ffmpeg off PATH) — never crash the run, never mutate the main env. The web
+  job runner mirrors this: a stage skip → `done` with a note; a real exception →
+  job `error`.
 - **(f)** Output dirs are **slugified** (`io_utils.slugify`): `out/<slug(song)>/…`.
+  The web `/api/file` + `/api/download-all` routes only serve paths under the
+  output root / upload dir (path-guarded).
 - Container/CI note: `pretty_midi` 0.2.10 can fail to build on Debian-patched
   setuptools (`AttributeError: install_layout`). Workaround:
   `pip install "setuptools==59.8.0" && pip install --no-build-isolation pretty_midi`,
   then restore `setuptools>=68`.
-- Gradio 6: pass `theme=` to `launch()`, **not** `Blocks()` — `app.launch`
-  branches on `gradio.__version__` (gradio 4/5 still take it on `Blocks()`).
 
 ## Tests
 
 ```bash
 python -m pytest          # must stay green, GPU-free, no network/model downloads
 ```
+
+FastAPI routes are tested with the Pipeline mocked (`tests/test_webapp.py`, needs
+`fastapi`+`httpx`, skipped if absent); the drum backends mock demucs / the
+audio-separator CLI. No model downloads, no real separation in CI.
 
 Mock the audio-separator CLI by monkeypatching `separate_uvr.subprocess.run`
 (plus `find_cli` / `have_ffmpeg` for preflight) — no venv creation and no model

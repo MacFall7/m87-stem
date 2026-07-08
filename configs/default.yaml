@@ -61,13 +61,17 @@ midi:
 drums:
   split:
     enabled: false
-    backend: uvr              # uvr (isolated .venv-uvr audio-separator) | larsnet | external
+    backend: demucs_inagoy    # demucs_inagoy (main-env Demucs, default) | uvr | larsnet | external
     model: drumsep_roformer   # legacy label for the larsnet/external paths
-    parts: [kick, snare, toms, hihat, ride, crash]
+    parts: [kick, snare, toms, other]   # inagoy/drumsep emits these 4
     from_input: false         # true = tear down the raw input loop (skip needing a drums stem)
-    uvr_model: null           # DrumSep checkpoint filename; null = auto-discover (--list_filter=drums)
-    uvr_model_dir: models/uvr # shared audio-separator model cache
-    uvr_venv: .venv-uvr       # shared isolated venv (see `stemforge setup-sota`)
+    # inagoy/drumsep: a Demucs checkpoint, auto-downloaded to models/drumsep/ on first use
+    inagoy_url: https://huggingface.co/mnstrmnl/drumsep/resolve/main/drumsep.th
+    inagoy_model_dir: models/drumsep
+    # uvr drum path (isolated venv) — audio-separator has no per-hit model, kept as an option
+    uvr_model: null
+    uvr_model_dir: models/uvr
+    uvr_venv: .venv-uvr
     uvr_use_autocast: true
     larsnet_wiener: 1.0       # alpha-Wiener filter for LarsNet crosstalk reduction
     external_cmd: null        # optional shell template for repo-based inference
