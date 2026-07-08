@@ -1,0 +1,192 @@
+"""§5.9 cli — Typer command line. Scriptable batch counterpart to the Gradio UI.
+
+Examples
+--------
+    stemforge doctor
+    stemforge separate song.wav --model htdemucs_ft -o out/
+    stemforge run song.wav --target-bpm 120 --midi --drum-split --drum-midi --stretch
+    stemforge run song.wav --set separation.segment=8 --set midi.onset_threshold=0.6
+    stemforge ui
+"""
+
+
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .orchestrator import Pipeline, load_config
+
+app = typer.Typer(add_completion=False, help="StemForge — local audio workstation.")
+console = Console()
+
+
+# --------------------------------------------------------------------------- #
+def _overrides_from_sets(sets: list[str]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for item in sets:
+        if "=" not in item:
+            raise typer.BadParameter(f"--set expects key=value, got {item!r}")
+        key, raw = item.split("=", 1)
+        out[key.strip()] = _coerce(raw.strip())
+    return out
+
+
+def _coerce(v: str) -> object:
+    low = v.lower()
+    if low in {"true", "false"}:
+        return low == "true"
+    if low in {"null", "none"}:
+        return None
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    return v
+
+
+def _summarize(manifest: dict) -> None:
+    t = Table(title=f"StemForge · {manifest['input']['filename']}", show_header=True)
+    t.add_column("stage")
+    t.add_column("result", overflow="fold")
+
+    ana = manifest.get("analysis", {})
+    if "source_bpm" in ana:
+        t.add_row("analysis", f"{ana['engine']} · {ana['source_bpm']} BPM · {ana['num_beats']} beats")
+    else:
+        t.add_row("analysis", str(ana))
+
+    sep = manifest.get("separation", {})
+    if "files" in sep:
+        t.add_row("separation", f"{sep['model']} · " + ", ".join(sep["files"]))
+    else:
+        t.add_row("separation", str(sep))
+
+    for key in ("midi", "drum_split", "drum_midi", "stretch"):
+        val = manifest.get(key, {})
+        if isinstance(val, dict) and "files" in val:
+            t.add_row(key, ", ".join(map(str, (val["files"] if isinstance(val["files"], list) else val["files"].keys()))))
+        else:
+            t.add_row(key, str(val))
+    console.print(t)
+
+
+# --------------------------------------------------------------------------- #
+@app.command()
+def doctor() -> None:
+    """Phase-0 gate: verify GPU, ffmpeg, rubberband, and imports."""
+    import shutil
+
+    t = Table(title="StemForge doctor", show_header=True)
+    t.add_column("check")
+    t.add_column("status")
+
+    # torch / CUDA
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+        name = torch.cuda.get_device_name(0) if cuda else "-"
+        t.add_row("torch", f"{torch.__version__}")
+        t.add_row("CUDA", f"[green]available[/] · {name}" if cuda else "[yellow]CPU only[/]")
+    except Exception as e:  # noqa: BLE001
+        t.add_row("torch", f"[red]missing[/] ({e})")
+
+    for mod in ("demucs", "beat_this", "onnxruntime", "basic_pitch", "pyrubberband", "gradio"):
+        try:
+            __import__(mod)
+            t.add_row(mod, "[green]ok[/]")
+        except Exception:  # noqa: BLE001
+            t.add_row(mod, "[yellow]not installed[/]")
+
+    for name in ("ffmpeg", "rubberband"):
+        t.add_row(name, "[green]ok[/]" if shutil.which(name) else "[yellow]not on PATH[/]")
+
+    console.print(t)
+
+
+@app.command()
+def separate(
+    input: Path = typer.Argument(..., exists=True, dir_okay=False, help="Audio file."),
+    model: str = typer.Option("htdemucs_ft", help="htdemucs_ft | htdemucs_6s | htdemucs"),
+    out: Path = typer.Option(Path("out"), "-o", "--out", help="Output root."),
+    segment: float = typer.Option(10.0, help="VRAM control (seconds)."),
+    device: str = typer.Option("auto", help="auto | cuda | cpu"),
+) -> None:
+    """Separation only (Phase 1)."""
+    cfg = load_config(overrides={
+        "separation.model": model, "separation.segment": segment,
+        "output.root": str(out), "device": device,
+        "analysis.enabled": False,
+    })
+    manifest = Pipeline(cfg).run(input)
+    _summarize(manifest)
+
+
+@app.command()
+def analyze(
+    input: Path = typer.Argument(..., exists=True, dir_okay=False),
+    engine: str = typer.Option("beat_this", help="beat_this | librosa"),
+    device: str = typer.Option("auto"),
+) -> None:
+    """Tempo / beat / downbeat only."""
+    cfg = load_config(overrides={
+        "analysis.engine": engine, "device": device,
+        "separation.enabled": False,
+    })
+    manifest = Pipeline(cfg).run(input)
+    console.print(manifest.get("analysis", {}))
+
+
+@app.command()
+def run(
+    input: Path = typer.Argument(..., exists=True, dir_okay=False),
+    config: Optional[Path] = typer.Option(None, help="Custom YAML config."),
+    out: Path = typer.Option(Path("out"), "-o", "--out"),
+    model: str = typer.Option("htdemucs_ft"),
+    target_bpm: Optional[float] = typer.Option(None, "--target-bpm"),
+    midi: bool = typer.Option(False, "--midi"),
+    drum_split: bool = typer.Option(False, "--drum-split"),
+    drum_midi: bool = typer.Option(False, "--drum-midi"),
+    stretch: bool = typer.Option(False, "--stretch"),
+    device: str = typer.Option("auto"),
+    segment: float = typer.Option(10.0),
+    set_: list[str] = typer.Option([], "--set", help="Dotted override key=value (repeatable)."),
+) -> None:
+    """Full pipeline (all four capabilities, gated by flags)."""
+    overrides: dict[str, object] = {
+        "output.root": str(out),
+        "separation.model": model,
+        "separation.segment": segment,
+        "device": device,
+        "midi.enabled": midi,
+        "drums.split.enabled": drum_split,
+        "drums.midi.enabled": drum_midi,
+        "stretch.enabled": stretch or target_bpm is not None,
+    }
+    if target_bpm is not None:
+        overrides["stretch.target_bpm"] = target_bpm
+    overrides.update(_overrides_from_sets(set_))
+    cfg = load_config(path=config, overrides=overrides)
+    manifest = Pipeline(cfg).run(input)
+    _summarize(manifest)
+    console.print(f"[dim]manifest:[/] {Path(cfg.output.root) / manifest['input']['filename'].rsplit('.',1)[0] / 'manifest.json'}")
+
+
+@app.command()
+def ui(
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(7860),
+    share: bool = typer.Option(False, "--share", help="Create a public Gradio link."),
+) -> None:
+    """Launch the local Gradio web app."""
+    from .app import build_ui
+
+    build_ui().launch(server_name=host, server_port=port, share=share)
+
+
+if __name__ == "__main__":
+    app()

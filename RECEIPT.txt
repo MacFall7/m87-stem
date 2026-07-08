@@ -1,0 +1,28 @@
+# StemForge build receipt — 2026-07-08T17:57:32Z
+# sha256  path
+a2a9ed420a6190d62f083b8536722023d96a894011c7c2b6dfee7d747839eede  ./.gitignore
+5da1d2ba832f37a467fc1b8ce176122da1af22179fd0d853bb49dff773be6da8  ./README.md
+520b659a9284909c74baca085f8f5190f3e9572e9549df52e7782c14e64991ec  ./configs/default.yaml
+a4baf962141cc80b98cc14469edca6415fafa87dc673027a62561014e3a386a7  ./models/README.md
+d2642946efe00e17fc75e8973794fd65605b505b41e2a99468c17501245bbceb  ./pyproject.toml
+3629a4e61381562d145d6a586038a27cdd57c322e92f8df9562ce09688d2d55f  ./src/stemforge/__init__.py
+3dca6ae5abcc4dc09fc1a1d0f7bf5fb92c26b0e98dc3dcfc44a9d8489a3bf81b  ./src/stemforge/analysis.py
+55da0c19ed3a6c1b40e8988288a404e2de70e950f6849a6b0dfbbd1f97854f6d  ./src/stemforge/app.py
+04bb9f7d1b998c2a11c53cbfc73e3ce71975b673b5a29f20d1148bff30ba0fc7  ./src/stemforge/cli.py
+48ac9096198a60e094f2d2e6fdb7829c66f7dff9f45b662045f9b97ffac374a8  ./src/stemforge/drum_midi.py
+2ece62f1cb471947dce44ee43b3f34a29f13cbc5962e887d4da840f6c4569aed  ./src/stemforge/drum_split.py
+9c4443bb0e0d09b15b0cdcebe7ac45f08eaa42e3609c6acde2bfa2ffc78b3224  ./src/stemforge/ingest.py
+7b2718f1c78d1ebeffde5f1b53ca90784ee65878cc519d0f8e7a28559e8b264b  ./src/stemforge/io_utils.py
+6140b97c603c558ced68aaec83d4ee53245f157281d53831afdf9e59286df25b  ./src/stemforge/midi_melodic.py
+73fd24b374fbf7a98da26f96a242e7fca85eb55bc2a774f80f60f83b1f020bd6  ./src/stemforge/orchestrator.py
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./src/stemforge/py.typed
+85b04199af51795d507951d23486cf78bbe6df1d4270092181e3f3a13e695c27  ./src/stemforge/separate.py
+a2093355fea7306e07e646bad09cde15686d3edfcc232a84323398382186116e  ./src/stemforge/stretch.py
+6cc17b2cbe04e5ea75958d33f162846aa8c27ea21dfc23438ad809420cc6ba70  ./tests/README.md
+648e923a36ad484b4fe3081513cb4fafb65cc0a7e392164ad817a0925361ef68  ./tests/conftest.py
+12d14a788639a9d05f799a682f16607ab653109e3cf69bd3f033a0fcd8cb183a  ./tests/test_analysis.py
+f0090cb344dd2010f32830b1833f5a324e9755ed9509488cd58a718495b0e5e2  ./tests/test_config.py
+1078ef21dc951ef7943ef18b59f959d3a967817fed4dcd8bba29574444c79af6  ./tests/test_dsp.py
+dbc0e8d54ed91e52459d0fd7662f1d5d49986bb5f35a8b41667245f49821a1f5  ./tests/test_io.py
+10563835115e36e1a4d153189385477918948a031fdc3fe0f6334c1fd3892000  ./tests/test_pipeline.py
+07e7fca94f628e35d20d17e96bb8e5d5f2efa5ed4c870fdd7488ef795863fe43  ./tests/test_stretch.py

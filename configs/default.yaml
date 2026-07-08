@@ -1,0 +1,70 @@
+# StemForge default run configuration.
+# Every field maps 1:1 to stemforge.orchestrator.RunConfig.
+# Override any subtree from the CLI (`--set separation.model=htdemucs_6s`) or the Gradio UI.
+
+device: auto            # auto | cuda | cpu
+sample_rate: 44100      # Demucs/DrumSep native rate; ingest resamples to this
+channels: 2
+seed: 0
+
+ingest:
+  normalize: replaygain # replaygain | peak | none
+  target_lufs: -18.0    # used when normalize == replaygain/peak fallback
+
+analysis:
+  enabled: true
+  engine: beat_this     # beat_this | librosa  (librosa is the dependency-free fallback)
+  bpm_from_regression: true   # robust source-BPM via linear regression over beat times
+
+separation:
+  enabled: true
+  model: htdemucs_ft    # htdemucs_ft (4-stem, best) | htdemucs_6s (adds guitar/piano) | htdemucs
+  stems: [vocals, drums, bass, other]   # 6s adds: guitar, piano
+  segment: 10           # seconds; lower => less VRAM
+  overlap: 0.25
+  shifts: 1             # >1 = test-time augmentation (slower, slightly better)
+  export_formats: [wav] # wav | flac | mp3
+  no_cuda_memory_caching: false  # set true on <=3 GB VRAM cards
+
+stretch:
+  enabled: false
+  target_bpm: null      # e.g. 120 ; null disables
+  engine: rubberband    # rubberband | signalsmith
+  crisp: 5              # Rubber Band transient/crispness 0-6
+  preserve_formant: true # keep formants on vocal stems
+  per_stem_target_bpm: {}   # e.g. {drums: 90} to override a single stem
+
+midi:
+  enabled: false
+  engine: onnx          # onnx (preferred, no TF) | basic_pitch (pulls TensorFlow)
+  onnx_model_path: models/basic_pitch.onnx
+  stems: [bass, other, guitar, piano]  # which melodic stems to transcribe
+  monophonic_stems: [bass]  # constrain to 1 note at a time -> far higher accuracy
+  onset_threshold: 0.5
+  frame_threshold: 0.3
+  min_note_length_ms: 58
+  min_frequency: 32.7   # C1
+  max_frequency: 3000.0
+  melodia_trick: true
+  include_pitch_bends: true
+  quantize_to_grid: false
+
+drums:
+  split:
+    enabled: false
+    model: drumsep_roformer   # drumsep_roformer (6-stem) | larsnet (5-stem) | inagoy (4-stem)
+    parts: [kick, snare, toms, hihat, ride, crash]
+    larsnet_wiener: 1.0       # alpha-Wiener filter for LarsNet crosstalk reduction
+    external_cmd: null        # optional shell template for repo-based inference
+  midi:
+    enabled: false
+    adt_model: adtof          # adtof (CRNN, 5-class) | omnizart | adtlib
+    expand_to_7class: true    # crash/ride + open/closed hi-hat via stem-loudness heuristics
+    velocity_from_stems: true # RMS envelope -> MIDI velocity
+    velocity_window_ms: 50
+    velocity_hop_ms: 10
+    external_cmd: null
+
+output:
+  root: out             # per-song bundle: out/<song>/{stems,midi,drums,stretched}
+  write_manifest: true

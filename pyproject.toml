@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stemforge"
+version = "0.1.0"
+description = "Local, GPU-accelerated audio workstation: stem separation, MIDI transcription, BPM time-stretch, drum decomposition."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { text = "MIT" }
+authors = [{ name = "Mac McFall" }]
+
+# --- Core deps: pure-Python / no framework conflict. Safe to install anywhere. ---
+# NOTE: torch / torchaudio are intentionally NOT listed here. Install them FIRST
+# from the CUDA-matched index (see README §Install), then `pip install -e .[all]`.
+dependencies = [
+    "numpy>=1.24,<2.2",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.0",
+    "tqdm>=4.66",
+    "pretty_midi>=0.2.10",
+    "mido>=1.3",
+    "pyloudnorm>=0.1.1",   # ReplayGain/LUFS fallback when Essentia is absent
+]
+
+[project.optional-dependencies]
+# Stem + drum separation (needs torch installed first).
+separation = ["demucs>=4.0.1"]
+
+# Tempo / beat / downbeat. beat_this is the primary engine (PyTorch, no numpy pin).
+# If the PyPI name resolves, great; otherwise install from git (see README).
+beats = ["beat-this>=0.1.0"]
+
+# Melodic -> MIDI. ONNX Runtime ONLY (no TensorFlow) per design §3.
+midi = ["onnxruntime-gpu>=1.17"]
+
+# Convenience note-postprocessing helpers from Spotify's package.
+# WARNING: this pulls TensorFlow and can collide with the torch CUDA stack.
+# Use ONLY if you understand the tradeoff; the ONNX path (extra `midi`) is preferred.
+midi-tf = ["basic-pitch>=0.4.0"]
+
+# Time-stretch. pyrubberband needs the system `rubberband` CLI (see README).
+stretch = ["pyrubberband>=0.3.0", "python-stretch>=0.3.0"]
+
+# Local web UI.
+ui = ["gradio>=4.44"]
+
+# Everything pip-installable and conflict-free in one go (excludes torch + TF).
+all = [
+    "demucs>=4.0.1",
+    "beat-this>=0.1.0",
+    "onnxruntime-gpu>=1.17",
+    "pyrubberband>=0.3.0",
+    "python-stretch>=0.3.0",
+    "gradio>=4.44",
+]
+
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+stemforge = "stemforge.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/maccmcfall/stemforge"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+stemforge = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

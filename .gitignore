@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env_torch/
+
+# Model weights (downloaded, large)
+models/*.onnx
+models/*.pt
+models/*.th
+models/*.ckpt
+models/**/*.bin
+
+# Run outputs
+out/
+*.wav
+*.flac
+*.mid
+!tests/**/*.wav
+!tests/**/*.mid
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
