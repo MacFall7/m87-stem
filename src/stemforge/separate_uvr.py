@@ -61,6 +61,30 @@ _STEM_TOKEN_MAP = {
 
 _TOKEN_RE = re.compile(r"\(([^()]+)\)")
 
+# Parenthesized stem token in drum-model output filenames -> canonical part name.
+_DRUM_TOKEN_MAP = {
+    "kick": "kick",
+    "bass drum": "kick",
+    "bassdrum": "kick",
+    "bd": "kick",
+    "snare": "snare",
+    "sd": "snare",
+    "toms": "toms",
+    "tom": "toms",
+    "hihat": "hihat",
+    "hi-hat": "hihat",
+    "hh": "hihat",
+    "hat": "hihat",
+    "ride": "ride",
+    "crash": "crash",
+    "cymbals": "crash",
+    "cymbal": "crash",
+    "other": "other",
+}
+
+# Model-file extensions audio-separator lists / caches, used to parse `--list_*`.
+_MODEL_EXT_RE = re.compile(r"[\w.\-]+\.(?:ckpt|onnx|yaml|th|pt|pth|safetensors)", re.IGNORECASE)
+
 # Anchor for relative venv/model dirs (same anchor as configs/ in orchestrator),
 # so neither the venv nor the checkpoint cache is duplicated per working dir.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +113,20 @@ def canonical_stem_name(filename: PathLike) -> str:
         key = token.strip().lower()
         if key in _STEM_TOKEN_MAP:
             return _STEM_TOKEN_MAP[key]
+    return slugify(stem).lower()
+
+
+def canonical_drum_part(filename: PathLike) -> str:
+    """Map a drum-model output filename to a canonical part name.
+
+    ``loop_(Kick)_drumsep.wav`` -> ``kick``; ``(Hi-Hat)`` -> ``hihat``. Unknown
+    tokens keep a slugified stem so no produced file is silently dropped.
+    """
+    stem = Path(filename).stem
+    for token in _TOKEN_RE.findall(stem):
+        key = token.strip().lower()
+        if key in _DRUM_TOKEN_MAP:
+            return _DRUM_TOKEN_MAP[key]
     return slugify(stem).lower()
 
 
@@ -123,6 +161,44 @@ def find_cli(venv_dir: Path) -> Path | None:
 
 def have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def list_drum_models(cli: Path, model_file_dir: str) -> list[str]:
+    """Discover installed/available drum-separation models in the isolated venv.
+
+    Runs ``audio-separator --list_filter=drums`` (the CLI's own filtered listing)
+    and extracts model filenames from its output. Returns an empty list on any
+    failure — the caller fails soft.
+    """
+    cmd = [str(cli), "--list_filter=drums", "--model_file_dir", str(model_file_dir)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for match in _MODEL_EXT_RE.findall(proc.stdout or ""):
+        if match not in out:
+            out.append(match)
+    return out
+
+
+def discover_drum_model(cli: Path, model_file_dir: str) -> str | None:
+    """Pick the best drum model available, preferring a full 6-piece kit.
+
+    Preference order: names hinting at a 6-stem / kick-snare-toms-hh-ride-crash
+    kit, then a dedicated ``drumsep`` model, then whatever is listed first.
+    Returns None when no drum model is available (fail-soft skip upstream).
+    """
+    models = list_drum_models(cli, model_file_dir)
+    if not models:
+        return None
+    for hint in ("6", "kick", "drumsep", "drum_sep"):
+        for m in models:
+            if hint in m.lower():
+                return m
+    return models[0]
 
 
 def venv_torch_status(venv_dir: Path) -> dict | None:
@@ -276,19 +352,34 @@ class UvrEngine:
     backend.
     """
 
-    def __init__(self, cfg: "SeparationCfg", work_dir: PathLike | None = None):
-        self.cli = preflight(cfg)
-        self.model_filename: str = cfg.uvr_model
-        self.model_file_dir: str = _resolve_model_dir(cfg.uvr_model_dir)
-        self.use_autocast: bool = cfg.uvr_use_autocast
+    def __init__(self, cli: Path, model_filename: str, model_file_dir: str,
+                 use_autocast: bool = True, work_dir: PathLike | None = None):
+        self.cli = cli
+        self.model_filename = model_filename
+        self.model_file_dir = model_file_dir
+        self.use_autocast = use_autocast
         owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="stemforge-uvr-"))
         ensure_dir(self.work_dir)
         if owns_work_dir:  # remove the scratch dir when the engine is collected
             self._cleanup = weakref.finalize(self, shutil.rmtree, str(self.work_dir), True)
 
-    def separate_file(self, path: PathLike) -> dict[str, Path]:
-        """Run the venv CLI on an audio file; return canonical name -> path."""
+    @classmethod
+    def from_cfg(cls, cfg: Any, model_filename: str | None = None,
+                 work_dir: PathLike | None = None) -> "UvrEngine":
+        """Build a preflighted engine from any cfg exposing the ``uvr_*`` fields
+        (``SeparationCfg`` or ``DrumSplitCfg``). ``model_filename`` overrides
+        ``cfg.uvr_model`` (used when a drum model is auto-discovered)."""
+        return cls(
+            cli=preflight(cfg),
+            model_filename=model_filename or cfg.uvr_model,
+            model_file_dir=_resolve_model_dir(cfg.uvr_model_dir),
+            use_autocast=getattr(cfg, "uvr_use_autocast", True),
+            work_dir=work_dir,
+        )
+
+    def run(self, path: PathLike) -> list[Path]:
+        """Run the venv CLI on an audio file; return the produced stem files."""
         before = {p for p in self.work_dir.iterdir()}
         cmd = [
             str(self.cli), str(path),
@@ -305,8 +396,11 @@ class UvrEngine:
             raise RuntimeError(
                 f"audio-separator exited with {proc.returncode}: " + " | ".join(tail)
             )
-        produced = sorted(p for p in self.work_dir.iterdir() if p not in before and p.is_file())
-        return {canonical_stem_name(p.name): p for p in produced}
+        return sorted(p for p in self.work_dir.iterdir() if p not in before and p.is_file())
+
+    def separate_file(self, path: PathLike) -> dict[str, Path]:
+        """Run the venv CLI on an audio file; return canonical stem name -> path."""
+        return {canonical_stem_name(p.name): p for p in self.run(path)}
 
 
 def separate(
@@ -323,7 +417,7 @@ def separate(
     CUDA automatically inside its own venv.
     """
     if engine is None or engine.model_filename != cfg.uvr_model:
-        engine = UvrEngine(cfg)
+        engine = UvrEngine.from_cfg(cfg)
 
     in_path = engine.work_dir / f"{uuid.uuid4().hex[:12]}.wav"
     save_audio(in_path, audio)
@@ -339,3 +433,44 @@ def separate(
     from .separate import _select  # honor cfg.stems the same way the demucs backend does
 
     return _select(stems, cfg), engine
+
+
+def separate_drums(
+    audio: AudioTensor,
+    cfg: Any,
+    engine: UvrEngine | None = None,
+) -> tuple[dict[str, AudioTensor], str, UvrEngine]:
+    """Tear a drum loop / drums stem into hit parts, in the isolated venv.
+
+    ``cfg`` is a ``DrumSplitCfg`` (exposes the ``uvr_*`` fields). The drum model
+    is ``cfg.uvr_model`` when set, otherwise auto-discovered via
+    ``audio-separator --list_filter=drums``. Returns ``(parts, model, engine)``
+    with parts keyed by canonical name (kick/snare/toms/hihat/ride/crash/…).
+
+    Raises :class:`SotaEnvError` (fail-soft upstream) when ffmpeg / the venv /
+    a drum model is missing; the main env is never touched.
+    """
+    cli = preflight(cfg)  # ffmpeg + venv, else SotaEnvError
+    model_dir = _resolve_model_dir(cfg.uvr_model_dir)
+    model = cfg.uvr_model or discover_drum_model(cli, model_dir)
+    if not model:
+        raise SotaEnvError(
+            "no drum-separation model available in the venv — set "
+            "`drums.split.uvr_model` to a DrumSep checkpoint, or install one "
+            "(the model auto-downloads on first use once named)"
+        )
+
+    if engine is None or engine.model_filename != model:
+        engine = UvrEngine.from_cfg(cfg, model_filename=model)
+
+    in_path = engine.work_dir / f"{uuid.uuid4().hex[:12]}.wav"
+    save_audio(in_path, audio)
+    produced: list[Path] = []
+    try:
+        produced = engine.run(in_path)
+        parts = {canonical_drum_part(p.name): load_audio(p) for p in produced}
+    finally:
+        in_path.unlink(missing_ok=True)
+        for p in produced:
+            p.unlink(missing_ok=True)
+    return parts, model, engine

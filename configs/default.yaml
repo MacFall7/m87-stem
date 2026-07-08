@@ -61,8 +61,14 @@ midi:
 drums:
   split:
     enabled: false
-    model: drumsep_roformer   # drumsep_roformer (6-stem) | larsnet (5-stem) | inagoy (4-stem)
+    backend: uvr              # uvr (isolated .venv-uvr audio-separator) | larsnet | external
+    model: drumsep_roformer   # legacy label for the larsnet/external paths
     parts: [kick, snare, toms, hihat, ride, crash]
+    from_input: false         # true = tear down the raw input loop (skip needing a drums stem)
+    uvr_model: null           # DrumSep checkpoint filename; null = auto-discover (--list_filter=drums)
+    uvr_model_dir: models/uvr # shared audio-separator model cache
+    uvr_venv: .venv-uvr       # shared isolated venv (see `stemforge setup-sota`)
+    uvr_use_autocast: true
     larsnet_wiener: 1.0       # alpha-Wiener filter for LarsNet crosstalk reduction
     external_cmd: null        # optional shell template for repo-based inference
   midi:

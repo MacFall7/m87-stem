@@ -17,11 +17,22 @@ Rubber Band stretch, a Typer CLI, and a Gradio UI.
   `(dict[str, AudioTensor], model)` so the Pipeline can cache weights across a batch.
 - `src/stemforge/separate_uvr.py` — SOTA backend via **audio-separator**
   (BS-Roformer & the UVR model zoo), run as a **subprocess from an isolated
-  venv** (`.venv-uvr`) — never imported in-process. Same `(stems, engine)` contract.
-- `src/stemforge/cli.py` — Typer CLI (`stemforge doctor|separate|analyze|run|ui`).
-- `src/stemforge/app.py` — Gradio UI (preset dropdown, progress, open-output-folder).
-- `tests/` — **GPU-free**; every heavy dep is mocked (see `tests/test_separation_backends.py`
-  for the fake `audio_separator` module injection). Synthetic audio from `conftest.py`.
+  venv** (`.venv-uvr`) — never imported in-process. Same `(stems, engine)`
+  contract. Also hosts `separate_drums()` + drum-model discovery
+  (`--list_filter=drums`), reused by the drum splitter.
+- `src/stemforge/drum_split.py` — drum teardown. `backend: uvr` runs a DrumSep
+  model through the **same** `.venv-uvr` subprocess (`separate_uvr.separate_drums`);
+  accepts a raw drum LOOP (`from_input`) or the separated drums stem; parts feed
+  the existing parts-based `drum_midi` (onset + RMS-velocity + GM mapping).
+- `src/stemforge/cli.py` — Typer CLI (`doctor|setup-sota|separate|analyze|run|ui|desktop-shortcut`).
+- `src/stemforge/app.py` — the **M87 Space-Tech workstation** (Gradio): four
+  workflow panels (Extract Stems / Drum Teardown / Melodic → MIDI / Full
+  Teardown), a dark CSS theme whose colors/fonts are CSS variables at the top of
+  `M87_CSS` (`--m87-bg` … `--m87-mono`), progress, per-stem audition, and an
+  open-output-folder button. Theme + CSS pass via `launch()` on Gradio 6.
+- `tests/` — **GPU-free**; every heavy dep is mocked. The audio-separator CLI
+  subprocess (stem + drum) is mocked in `tests/test_separation_backends.py` /
+  `tests/test_drum_split.py`; synthetic audio from `conftest.py`.
 
 ## Separation backends & quality presets
 
@@ -87,6 +98,28 @@ Backend semantics worth knowing:
   cwd) so neither the venv nor the checkpoint cache is duplicated per working
   directory; `UvrEngine` removes its scratch dir via `weakref.finalize`.
 
+## Drum teardown (same isolated venv — do not regress)
+
+`drums.split.backend = uvr` (default) tears a **drum loop** or the separated
+drums stem into hit parts through the **same** `.venv-uvr` subprocess runner —
+`separate_uvr.separate_drums()` builds a `UvrEngine.from_cfg(drum_cfg, model=…)`
+and runs it exactly like stem separation. audio-separator is still never
+imported in-process.
+
+- Model: `drums.split.uvr_model` when set, else **auto-discovered** via
+  `audio-separator --list_filter=drums` (`discover_drum_model`, prefers a
+  6-piece kit). Output tokens `(Kick)/(Snare)/(Toms)/(HiHat)/(Ride)/(Crash)` map
+  to canonical parts through `separate_uvr.canonical_drum_part()`.
+- Input: `drums.split.from_input=true` tears down the **raw input loop** (no
+  separation needed); otherwise it uses `ctx.stems["drums"]`. The orchestrator
+  passes `ctx.audio` as an `AudioTensor` for the from-input case.
+- The produced parts feed the existing parts-based `drum_midi` (onset detection +
+  RMS→velocity + GM note mapping, 5→7 hi-hat expansion), so a drum loop yields
+  **both** individual hit stems **and** a GM drum `.mid`.
+- Fail-soft: missing venv/ffmpeg/**drum model** → manifest `skipped` with a
+  `stemforge setup-sota` hint; a nonzero CLI exit → `error` (stderr tail). Never
+  crashes, never touches the main env.
+
 ## Verified install recipe (order matters)
 
 ```bash
@@ -110,6 +143,12 @@ stemforge setup-sota      # .venv-uvr: CUDA torch + audio-separator[gpu], cu124 
 
 ## Launch the app
 
+- The UI is the **M87 Space-Tech workstation** (`app.py`): four workflow panels
+  (Extract Stems · Drum Teardown · Melodic → MIDI · Full Teardown), not a
+  checkbox grid. Colors/fonts are CSS variables at the top of `M87_CSS`
+  (`--m87-bg`, `--m87-surface`, `--m87-accent`, `--m87-accent-2`, `--m87-text`,
+  `--m87-mono`) — swap them for real M87 tokens. Theme + CSS pass via `launch()`
+  on Gradio 6 (`build_ui(theme=, css=)` on 4/5).
 - **CLI:** `stemforge ui` starts Gradio and (by default) opens the browser via
   gradio's `inbrowser=True`; `--no-open` suppresses it (`app.launch(open_browser=…)`).
 - **Double-click:** `stemforge desktop-shortcut` drops a Desktop launcher —

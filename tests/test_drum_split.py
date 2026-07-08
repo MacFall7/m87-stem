@@ -1,0 +1,225 @@
+"""Drum teardown via the isolated .venv-uvr subprocess — GPU-free, CLI mocked.
+
+No venv is built and nothing is downloaded: the audio-separator CLI (both the
+`--list_filter=drums` discovery call and the separation call) is mocked, and
+preflight (ffmpeg + venv) is stubbed.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from stemforge import drum_split, separate_uvr
+from stemforge.io_utils import AudioTensor
+from stemforge.orchestrator import Pipeline, load_config
+from stemforge.separate_uvr import canonical_drum_part, discover_drum_model
+
+_DRUM_MODEL = "drumsep_mel_band_roformer_6stem.ckpt"
+_DRUM_LIST_OUTPUT = f"""\
+Model Filename                                   Arch        Stems
+-----------------------------------------------  ----------  ----------------------------
+{_DRUM_MODEL}   MelRoformer  Kick, Snare, Toms, HiHat, Ride, Crash
+some_4stem_drum_model.ckpt                        Demucs      Kick, Snare, Toms, Cymbals
+"""
+
+_DRUM_TOKENS = ("Kick", "Snare", "Toms", "HiHat", "Ride", "Crash")
+
+
+# --------------------------------------------------------------------------- #
+# Token mapping + model discovery (pure)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("filename,expected", [
+    ("loop_(Kick)_drumsep.wav", "kick"),
+    ("loop_(Snare)_drumsep.wav", "snare"),
+    ("loop_(Toms)_drumsep.wav", "toms"),
+    ("loop_(HiHat)_drumsep.wav", "hihat"),
+    ("loop_(Hi-Hat)_x.wav", "hihat"),
+    ("loop_(Ride)_x.wav", "ride"),
+    ("loop_(Crash)_x.wav", "crash"),
+    ("loop_(Cymbals)_x.wav", "crash"),
+    ("loop_(BD)_x.wav", "kick"),
+    ("mystery_output.wav", "mystery_output"),  # unknown -> slug fallback
+])
+def test_canonical_drum_part(filename, expected):
+    assert canonical_drum_part(filename) == expected
+
+
+def test_discover_drum_model_prefers_six_stem(monkeypatch, tmp_path):
+    def fake_run(cmd, capture_output=False, text=False, **kw):
+        assert "--list_filter=drums" in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=_DRUM_LIST_OUTPUT, stderr="")
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    model = discover_drum_model(Path("cli"), str(tmp_path))
+    assert model == _DRUM_MODEL  # the 6-stem kit wins over the 4-stem
+
+
+def test_discover_drum_model_none_when_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        separate_uvr.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="no models\n", stderr=""),
+    )
+    assert discover_drum_model(Path("cli"), str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------- #
+# Mocked drum CLI (discovery + separation)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def fake_drum_cli(monkeypatch):
+    """Preflight passes; the CLI lists a drum model and writes per-hit WAVs."""
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(
+        separate_uvr, "find_cli", lambda venv_dir: Path(venv_dir) / "bin" / "audio-separator",
+    )
+    calls: dict = {"list": 0, "separate": 0}
+
+    def fake_run(cmd, capture_output=False, text=False, check=False, **kw):
+        cmd = [str(c) for c in cmd]
+        if any("--list_filter=drums" in c for c in cmd):
+            calls["list"] += 1
+            return subprocess.CompletedProcess(cmd, 0, stdout=_DRUM_LIST_OUTPUT, stderr="")
+        # separation call: {cli} {in} --model_filename ... --output_dir <dir> ...
+        calls["separate"] += 1
+        args = {cmd[i]: cmd[i + 1] for i in range(len(cmd) - 1)}
+        src = Path(cmd[1])
+        out_dir = Path(args["--output_dir"])
+        model = Path(args["--model_filename"]).stem
+        data, sr = sf.read(str(src), always_2d=True)
+        for token in _DRUM_TOKENS:
+            sf.write(str(out_dir / f"{src.stem}_({token})_{model}.wav"), data, sr)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    return calls
+
+
+def _drum_cfg(**over):
+    cfg = load_config().drums.split
+    cfg.enabled = True
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _click_loop() -> AudioTensor:
+    sr = 44100
+    y = np.zeros(int(sr * 2.0), dtype=np.float32)
+    for beat in np.arange(0, 2.0, 0.5):  # 120 BPM
+        i = int(beat * sr)
+        y[i:i + 200] = np.hanning(200).astype(np.float32)
+    return AudioTensor(np.stack([y, y]), sr)
+
+
+def test_separate_drums_maps_parts_and_uses_list_filter(fake_drum_cli):
+    parts, model, engine = separate_uvr.separate_drums(_click_loop(), _drum_cfg())
+    assert model == _DRUM_MODEL
+    assert set(parts) == {"kick", "snare", "toms", "hihat", "ride", "crash"}
+    assert all(isinstance(v, AudioTensor) for v in parts.values())
+    assert fake_drum_cli["list"] == 1 and fake_drum_cli["separate"] == 1
+    assert list(engine.work_dir.iterdir()) == []  # scratch cleaned up
+
+
+def test_split_writes_part_files(fake_drum_cli, tmp_path):
+    cfg = _drum_cfg()
+    res = drum_split.split(None, cfg, tmp_path, audio=_click_loop())
+    assert res["backend"] == "uvr"
+    assert res["model"] == _DRUM_MODEL
+    assert set(res["files"]) == {"kick", "snare", "toms", "hihat", "ride", "crash"}
+    for p in res["files"].values():
+        assert Path(p).is_file()
+
+
+def test_split_honors_parts_subset(fake_drum_cli, tmp_path):
+    cfg = _drum_cfg(parts=["kick", "snare"])
+    res = drum_split.split(None, cfg, tmp_path, audio=_click_loop())
+    assert set(res["files"]) == {"kick", "snare"}
+
+
+def test_explicit_uvr_model_skips_discovery(fake_drum_cli, tmp_path):
+    cfg = _drum_cfg(uvr_model="my_pinned_drum_model.ckpt")
+    res = drum_split.split(None, cfg, tmp_path, audio=_click_loop())
+    assert res["model"] == "my_pinned_drum_model.ckpt"
+    assert fake_drum_cli["list"] == 0  # no discovery call when pinned
+
+
+# --------------------------------------------------------------------------- #
+# Fail-soft (isolation preserved)
+# --------------------------------------------------------------------------- #
+def test_missing_venv_fails_soft(monkeypatch, tmp_path):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(separate_uvr, "find_cli", lambda venv_dir: None)
+    res = drum_split.split(None, _drum_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "setup-sota" in res["skipped"]
+
+
+def test_missing_ffmpeg_fails_soft(monkeypatch, tmp_path):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: False)
+    res = drum_split.split(None, _drum_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "ffmpeg" in res["skipped"]
+
+
+def test_no_drum_model_fails_soft(monkeypatch, tmp_path):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(
+        separate_uvr, "find_cli", lambda venv_dir: Path(venv_dir) / "bin" / "audio-separator",
+    )
+    monkeypatch.setattr(
+        separate_uvr.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess([str(c) for c in cmd], 0, stdout="", stderr=""),
+    )
+    res = drum_split.split(None, _drum_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and "drum" in res["skipped"].lower()
+
+
+def test_cli_crash_is_error_not_skip(monkeypatch, tmp_path):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(
+        separate_uvr, "find_cli", lambda venv_dir: Path(venv_dir) / "bin" / "audio-separator",
+    )
+
+    def fake_run(cmd, capture_output=False, text=False, **kw):
+        cmd = [str(c) for c in cmd]
+        if any("--list_filter=drums" in c for c in cmd):
+            return subprocess.CompletedProcess(cmd, 0, stdout=_DRUM_LIST_OUTPUT, stderr="")
+        return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="CUDA OOM")
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    res = drum_split.split(None, _drum_cfg(), tmp_path, audio=_click_loop())
+    assert "error" in res and "CUDA OOM" in res["error"]
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end: raw drum loop -> hit stems + GM drum MIDI
+# --------------------------------------------------------------------------- #
+def test_pipeline_drum_loop_to_stems_and_midi(fake_drum_cli, tmp_path):
+    loop = _click_loop()
+    wav = tmp_path / "break.wav"
+    sf.write(str(wav), loop.samples.T, loop.sample_rate, subtype="FLOAT")
+
+    cfg = load_config(overrides={
+        "ingest.normalize": "none",
+        "analysis.enabled": False,
+        "separation.enabled": False,     # a raw drum loop: no upstream separation
+        "drums.split.enabled": True,
+        "drums.split.from_input": True,  # tear down the input loop itself
+        "drums.midi.enabled": True,
+        "output.root": str(tmp_path / "out"),
+    })
+    m = Pipeline(cfg).run(wav)
+
+    ds = m["drum_split"]
+    assert ds["backend"] == "uvr"
+    assert set(ds["files"]) == {"kick", "snare", "toms", "hihat", "ride", "crash"}
+    drums_dir = tmp_path / "out" / "break" / "drums"
+    assert (drums_dir / "kick.wav").is_file()
+
+    dm = m["drum_midi"]
+    assert dm["source"] == "parts"
+    assert dm["note_count"] > 0
+    assert (drums_dir / "drums.mid").is_file()

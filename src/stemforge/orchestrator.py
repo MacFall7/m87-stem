@@ -139,8 +139,14 @@ class MidiCfg:
 @dataclass
 class DrumSplitCfg:
     enabled: bool = False
+    backend: str = "uvr"  # uvr (isolated .venv-uvr) | larsnet | external (via external_cmd)
     model: str = "drumsep_roformer"
     parts: list[str] = field(default_factory=lambda: ["kick", "snare", "toms", "hihat", "ride", "crash"])
+    from_input: bool = False  # tear down the raw input loop instead of the separated drums stem
+    uvr_model: str | None = None  # DrumSep checkpoint; None -> auto-discover (--list_filter=drums)
+    uvr_model_dir: str = "models/uvr"
+    uvr_venv: str = ".venv-uvr"  # shares the isolated audio-separator venv
+    uvr_use_autocast: bool = True
     larsnet_wiener: float = 1.0
     external_cmd: str | None = None
 
@@ -495,8 +501,13 @@ class Pipeline:
     def _run_drum_split(self, ctx: RunContext) -> None:
         from . import drum_split
 
+        scfg = self.cfg.drums.split
+        drums_path = ctx.stems.get("drums")
+        # from_input tears down the raw input loop itself; otherwise use the
+        # separated drums stem (drum_split fails soft if neither is available).
+        source_audio = ctx.audio if scfg.from_input else None
         ctx.manifest["drum_split"] = drum_split.split(
-            ctx.stems.get("drums"), self.cfg.drums.split, ctx.subdir("drums"), device=ctx.device,
+            drums_path, scfg, ctx.subdir("drums"), device=ctx.device, audio=source_audio,
         )
 
     def _run_drum_midi(self, ctx: RunContext) -> None:

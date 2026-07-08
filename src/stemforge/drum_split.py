@@ -1,18 +1,19 @@
-"""§5.5 drum_split — decompose the drum stem into kick/snare/toms/hh/ride/crash.
+"""§5.5 drum_split — decompose a drum loop / drums stem into kick/snare/toms/hh/…
 
-Primary: DrumSep (Jarredou/aufr33 MelBand Roformer 6-stem). Fallbacks: LarsNet
-(5-stem, alpha-Wiener option) and inagoy drumsep (4-stem HDemucs). These ship as
-repos + weights rather than clean PyPI packages, so the robust integration point
-is a configurable ``external_cmd`` template that runs the repo's inference and
-writes part WAVs, which we then map to canonical names.
+Primary path (``backend: uvr``): run a DrumSep-family model through the SAME
+isolated ``.venv-uvr`` audio-separator subprocess used for stem separation
+(``separate_uvr.separate_drums``) — never the main env. The drum model is
+``drums.split.uvr_model`` when set, else auto-discovered via
+``audio-separator --list_filter=drums``. Accepts a raw drum LOOP as input, not
+only the demucs drums stem.
 
-Set ``drums.split.external_cmd`` in the config, e.g.::
+Fallback (``external_cmd``): any repo-based separator via a shell template::
 
     external_cmd: "python /opt/drumsep/infer.py --in {input} --out {output_dir}"
 
-Placeholders ``{input}`` and ``{output_dir}`` are substituted. If no command is
-configured and no in-process adapter is available, a ``skipped`` record is
-returned so the pipeline continues.
+Placeholders ``{input}`` / ``{output_dir}`` are substituted. All paths fail
+soft: a missing venv / ffmpeg / drum model records ``{"skipped": ...}`` with a
+fix hint so the pipeline continues.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .io_utils import PathLike, ensure_dir
+from .io_utils import AudioTensor, PathLike, ensure_dir, load_audio, save_audio
 
 try:  # pragma: no cover
     from .orchestrator import DrumSplitCfg
@@ -45,16 +46,29 @@ def split(
     cfg: "DrumSplitCfg",
     out_dir: PathLike,
     device: str = "cuda",
+    audio: AudioTensor | None = None,
 ) -> dict[str, Any]:
-    if drums_path is None or not Path(drums_path).is_file():
-        return {"skipped": "no drums stem available (run separation first)"}
+    """Split a drum source into hit parts.
 
+    ``audio`` is the source to tear down (a raw drum loop or the drums stem) as
+    an ``AudioTensor``; when omitted it is loaded from ``drums_path``. The
+    ``external_cmd`` path always works from a file (``drums_path``).
+    """
     out_dir = ensure_dir(Path(out_dir))
+    backend = (getattr(cfg, "backend", "uvr") or "uvr").strip().lower()
 
+    # Explicit external command wins (repo-based DrumSep/LarsNet), any backend.
     if cfg.external_cmd:
+        if drums_path is None or not Path(drums_path).is_file():
+            return {"skipped": "external_cmd needs a drums file (run separation first)"}
         return _run_external(cfg.external_cmd, drums_path, out_dir, cfg)
 
+    if backend == "uvr":
+        return _uvr_split(audio, drums_path, cfg, out_dir)
+
     if cfg.model == "larsnet":
+        if drums_path is None or not Path(drums_path).is_file():
+            return {"skipped": "no drums stem available (run separation first)"}
         try:
             return _larsnet(drums_path, out_dir, cfg, device)
         except _NotWired as e:
@@ -71,6 +85,44 @@ def split(
 
 class _NotWired(RuntimeError):
     pass
+
+
+# --------------------------------------------------------------------------- #
+# UVR backend (isolated .venv-uvr subprocess) — the real, wired path
+# --------------------------------------------------------------------------- #
+def _uvr_split(
+    audio: AudioTensor | None, drums_path: PathLike | None,
+    cfg: "DrumSplitCfg", out_dir: Path,
+) -> dict[str, Any]:
+    from . import separate_uvr as uvr
+
+    if audio is None:
+        if drums_path is None or not Path(drums_path).is_file():
+            return {"skipped": "no drum audio (drop a drum loop or run separation first)"}
+        audio = load_audio(drums_path)
+
+    try:
+        parts, model, _engine = uvr.separate_drums(audio, cfg)
+    except uvr.SotaEnvError as e:  # missing venv / ffmpeg / drum model -> fail soft
+        return {"skipped": f"{e} — run `stemforge setup-sota`"}
+    except RuntimeError as e:  # CLI crashed inside a ready env -> real error
+        return {"error": f"drum separation failed: {e}", "backend": "uvr"}
+
+    if not parts:
+        return {"skipped": "drum model produced no recognizable parts", "backend": "uvr"}
+
+    wanted = set(cfg.parts) if getattr(cfg, "parts", None) else None
+    files: dict[str, str] = {}
+    for part, tensor in parts.items():
+        if wanted is not None and part not in wanted:
+            continue  # honor drums.split.parts (drop residual/unrequested parts)
+        files[part] = str(save_audio(out_dir / f"{part}.wav", tensor))
+
+    if not files:  # model output didn't intersect requested parts -> keep everything
+        for part, tensor in parts.items():
+            files[part] = str(save_audio(out_dir / f"{part}.wav", tensor))
+
+    return {"backend": "uvr", "model": model, "parts": list(files), "files": files}
 
 
 # --------------------------------------------------------------------------- #
@@ -122,4 +174,4 @@ def _larsnet(drums_path: PathLike, out_dir: Path, cfg: "DrumSplitCfg", device: s
 
 
 def available_models() -> list[str]:
-    return ["drumsep_roformer", "larsnet", "inagoy"]
+    return ["uvr", "drumsep_roformer", "larsnet", "inagoy"]
