@@ -119,3 +119,34 @@ def test_setup_sota_reports_failure(monkeypatch):
     monkeypatch.setattr(uvr_mod, "setup_sota_env", lambda cfg, venv=None, log=print: False)
     result = runner.invoke(cli.app, ["setup-sota"])
     assert result.exit_code == 1
+
+
+def test_ui_open_flag_defaults_true_and_toggles(monkeypatch):
+    import stemforge.app as app_mod
+
+    seen: dict = {}
+    monkeypatch.setattr(app_mod, "launch", lambda **kw: seen.update(kw))
+
+    assert runner.invoke(cli.app, ["ui"]).exit_code == 0
+    assert seen["open_browser"] is True
+
+    assert runner.invoke(cli.app, ["ui", "--no-open"]).exit_code == 0
+    assert seen["open_browser"] is False
+
+
+def test_desktop_shortcut_command(monkeypatch, tmp_path):
+    import stemforge.desktop as desktop_mod
+
+    made = tmp_path / "StemForge.lnk"
+    monkeypatch.setattr(desktop_mod, "create_shortcut", lambda log=print: made)
+    result = runner.invoke(cli.app, ["desktop-shortcut"])
+    assert result.exit_code == 0, result.output
+    assert "StemForge.lnk" in result.output
+
+
+def test_desktop_shortcut_command_failure(monkeypatch):
+    import stemforge.desktop as desktop_mod
+
+    monkeypatch.setattr(desktop_mod, "create_shortcut", lambda log=print: None)
+    result = runner.invoke(cli.app, ["desktop-shortcut"])
+    assert result.exit_code == 1

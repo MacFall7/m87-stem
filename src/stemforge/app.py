@@ -214,14 +214,20 @@ def build_ui(theme=None):
     return demo
 
 
-def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = False):
-    """Build + launch the UI. Gradio 6 takes the theme at launch(), not Blocks()."""
+def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
+           open_browser: bool = True):
+    """Build + launch the UI. Gradio 6 takes the theme at launch(), not Blocks().
+
+    ``open_browser`` maps to gradio's ``inbrowser`` — it pops the browser once
+    the server is up.
+    """
     import gradio as gr
 
     theme = gr.themes.Soft()
+    kw = dict(server_name=host, server_port=port, share=share, inbrowser=open_browser)
     if int(gr.__version__.split(".")[0]) >= 6:
-        return build_ui().launch(server_name=host, server_port=port, share=share, theme=theme)
-    return build_ui(theme=theme).launch(server_name=host, server_port=port, share=share)
+        return build_ui().launch(theme=theme, **kw)
+    return build_ui(theme=theme).launch(**kw)
 
 
 if __name__ == "__main__":
