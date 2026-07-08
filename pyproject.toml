@@ -32,7 +32,10 @@ dependencies = [
 separation = ["demucs>=4.0.1"]
 
 # SOTA separation (BS-Roformer & the UVR model zoo) via audio-separator.
-# NO TensorFlow — reuses the existing torch + onnxruntime-gpu stack.
+# WARNING: install this into the ISOLATED venv only (`stemforge setup-sota`
+# provisions <project>/.venv-uvr) — NEVER into the main env: on Windows/py3.11
+# it replaced torch 2.6.0+cu124 with CPU-only torch and bumped numpy to 2.4.x,
+# breaking the demucs GPU stack. StemForge calls it via subprocess.
 separation-sota = ["audio-separator[gpu]>=0.44"]
 
 # Tempo / beat / downbeat. beat_this is the primary engine (PyTorch, no numpy pin).

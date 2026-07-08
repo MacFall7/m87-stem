@@ -16,7 +16,8 @@ Rubber Band stretch, a Typer CLI, and a Gradio UI.
 - `src/stemforge/separate.py` — Demucs backend. Returns
   `(dict[str, AudioTensor], model)` so the Pipeline can cache weights across a batch.
 - `src/stemforge/separate_uvr.py` — SOTA backend via **audio-separator**
-  (BS-Roformer & the UVR model zoo). Same `(stems, engine)` contract.
+  (BS-Roformer & the UVR model zoo), run as a **subprocess from an isolated
+  venv** (`.venv-uvr`) — never imported in-process. Same `(stems, engine)` contract.
 - `src/stemforge/cli.py` — Typer CLI (`stemforge doctor|separate|analyze|run|ui`).
 - `src/stemforge/app.py` — Gradio UI (preset dropdown, progress, open-output-folder).
 - `tests/` — **GPU-free**; every heavy dep is mocked (see `tests/test_separation_backends.py`
@@ -36,34 +37,49 @@ resolves in `load_config` with precedence **yaml < preset < dotted overrides**
 | `sota` | uvr     | BS-Roformer `model_bs_roformer_ep_317_sdr_12.9755.ckpt` (2-stem: vocals + instrumental) |
 | `max`  | hybrid  | BS-Roformer vocals + `htdemucs_ft` on the instrumental residual → merged 4-stem (vocals/drums/bass/other) |
 
-audio-separator usage (see `separate_uvr.py`):
+## audio-separator isolation (CRITICAL — do not regress)
 
-```python
-from audio_separator.separator import Separator  # LAZY import only
-sep = Separator(output_dir=..., output_format="WAV", model_file_dir="models/uvr",
-                use_autocast=True,
-                demucs_params={"shifts": 2, "overlap": 0.25, "segment_size": "Default"})
-sep.load_model(model_filename="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
-files = sep.separate("audio.wav")   # list of output paths; models auto-download on first load
+**audio-separator is NEVER imported in-process.** It lives in its own venv
+(default `<project-root>/.venv-uvr`, config `separation.uvr_venv`, git-ignored)
+and is invoked as a subprocess (see `separate_uvr.UvrEngine.separate_file`):
+
+```
+<venv>/bin/audio-separator input.wav --model_filename <ckpt> \
+    --output_dir <scratch> --output_format WAV --model_file_dir models/uvr [--use_autocast]
 ```
 
-Output filenames carry a parenthesized stem token —
-`{track}_(Vocals)_{model}.wav`, `(Instrumental)`, and for 4-stem models
-`(Drums)/(Bass)/(Other)` — mapped to canonical stem names by
-`separate_uvr.canonical_stem_name()`.
+**Why (production incident, Windows/py3.11, 2026-07):** installing
+`audio-separator[gpu]` into the main env pulled a **CPU-only torch 2.13.0+cpu**
+that replaced torch 2.6.0+cu124 and bumped numpy to 2.4.6 — silently breaking
+the working demucs GPU stack. Isolation makes the clobber structurally
+impossible; the main interpreter's packages are never touched.
+
+- Provision with **`stemforge setup-sota`** (idempotent): creates the venv,
+  installs CUDA torch from the cu124 index FIRST, then `audio-separator[gpu]`
+  — into that venv ONLY. `stemforge doctor` shows the venv status.
+- `separate_uvr.preflight()` verifies ffmpeg + the venv CLI before every run
+  and raises `SotaEnvError` → the orchestrator records `{"skipped": ...}` with
+  a one-line fix hint. Separation never creates the venv or downloads anything.
+- Output filenames carry a parenthesized stem token —
+  `{track}_(Vocals)_{model}.wav`, `(Instrumental)`, and for 4-stem models
+  `(Drums)/(Bass)/(Other)` — mapped to canonical stem names by
+  `separate_uvr.canonical_stem_name()`; produced files are detected by
+  scratch-dir diff, loaded as `AudioTensor`, then deleted.
 
 Backend semantics worth knowing:
-- Missing optional deps fail soft with an install hint (`_SEPARATION_DEP_HINTS`);
-  any other `ModuleNotFoundError` is a real error and keeps its stage trace.
+- Missing demucs/torch fail soft with an install hint (`_SEPARATION_DEP_HINTS`);
+  any other `ModuleNotFoundError` is a real error and keeps its stage trace. A
+  nonzero audio-separator exit is also a real error (stderr tail in the manifest).
 - `hybrid` degrades to the finished 2-stem UVR result (with a manifest `notes`
   entry) if demucs is unavailable — completed GPU work is never discarded.
 - The UVR backend can't honor `device`/`segment` — audio-separator auto-picks
-  CUDA and manages its own chunking. Known upstream limitation.
+  CUDA inside its venv and manages its own chunking. Known upstream limitation.
 - Model caches are keyed `"<backend>:<model>"`; the Gradio app shares one cache
-  across clicks (`app._MODEL_CACHE`) so preset switches don't reload weights.
-- Relative `uvr_model_dir` is anchored at the project root (not cwd) so the
-  checkpoint cache doesn't re-download per working directory; `UvrEngine`
-  removes its scratch dir via `weakref.finalize`.
+  across clicks (`app._MODEL_CACHE`). The cached `UvrEngine` holds no weights
+  in-process (they live in the subprocess) but skips repeated preflights.
+- Relative `uvr_venv` / `uvr_model_dir` are anchored at the project root (not
+  cwd) so neither the venv nor the checkpoint cache is duplicated per working
+  directory; `UvrEngine` removes its scratch dir via `weakref.finalize`.
 
 ## Verified install recipe (order matters)
 
@@ -79,8 +95,9 @@ pip install -e .[all]        # demucs, beat_this, onnxruntime-gpu, pyrubberband,
 pip install --no-deps basic-pitch
 pip install "resampy<0.4.3" scikit-learn mir_eval
 
-# 4. SOTA separation (BS-Roformer / UVR zoo; reuses torch + onnxruntime-gpu, NO TF):
-pip install "audio-separator[gpu]"      # or: pip install -e .[separation-sota]
+# 4. SOTA separation (BS-Roformer / UVR zoo) — ISOLATED venv, never the main env:
+stemforge setup-sota      # creates .venv-uvr with CUDA torch + audio-separator[gpu]
+# (do NOT `pip install audio-separator` into the main env — it clobbers CUDA torch/numpy)
 
 # 5. System binaries: ffmpeg + rubberband (apt/brew/choco)
 ```
@@ -94,13 +111,14 @@ pip install "audio-separator[gpu]"      # or: pip install -e .[separation-sota]
   `typer.Option(False, "--midi")` — otherwise Typer/Click flag inference breaks.
 - **(c)** Require `typer>=0.15` — older typer + Click 8.4 raises
   `make_metavar() TypeError`.
-- **(d)** Keep `torch` / `demucs` / `onnxruntime` / `gradio` / `audio_separator`
-  **lazily imported** (inside functions), so `import stemforge` and pytest stay
-  GPU-free. `python -c "import sys, stemforge.app, stemforge.cli; ..."` must not
-  pull any of them.
+- **(d)** Keep `torch` / `demucs` / `onnxruntime` / `gradio` **lazily imported**
+  (inside functions), so `import stemforge` and pytest stay GPU-free.
+  `audio_separator` is stricter still: **never imported in this process at
+  all** — subprocess only (see the isolation section above for the
+  CPU-torch/numpy clobber that rule prevents).
 - **(e)** Pipeline stages stay **fail-soft**: a missing model/dependency records
-  `{"skipped": ...}` in the manifest (e.g. uvr backend without audio-separator
-  installed) — never crash the run.
+  `{"skipped": ...}` in the manifest (e.g. uvr backend without the `.venv-uvr`
+  env set up, or ffmpeg off PATH) — never crash the run, never mutate the main env.
 - **(f)** Output dirs are **slugified** (`io_utils.slugify`): `out/<slug(song)>/…`.
 - Container/CI note: `pretty_midi` 0.2.10 can fail to build on Debian-patched
   setuptools (`AttributeError: install_layout`). Workaround:
@@ -115,5 +133,7 @@ pip install "audio-separator[gpu]"      # or: pip install -e .[separation-sota]
 python -m pytest          # must stay green, GPU-free, no network/model downloads
 ```
 
-Mock `audio_separator` via `sys.modules` injection (never import the real thing
-in tests), mock Demucs by monkeypatching `stemforge.separate.separate`.
+Mock the audio-separator CLI by monkeypatching `separate_uvr.subprocess.run`
+(plus `find_cli` / `have_ffmpeg` for preflight) — no venv creation and no model
+downloads in CI; mock Demucs by monkeypatching `stemforge.separate.separate`.
+See `tests/test_separation_backends.py::fake_uvr_cli`.

@@ -94,3 +94,28 @@ def test_help_lists_preset():
         result = runner.invoke(cli.app, [cmd, "--help"])
         assert result.exit_code == 0
         assert "--preset" in result.output
+
+
+def test_setup_sota_invokes_provisioner(monkeypatch, tmp_path):
+    import stemforge.separate_uvr as uvr_mod
+
+    seen = {}
+
+    def fake_setup(cfg, venv=None, log=print):
+        seen["venv"] = venv
+        seen["default_venv"] = cfg.uvr_venv
+        return True
+
+    monkeypatch.setattr(uvr_mod, "setup_sota_env", fake_setup)
+    result = runner.invoke(cli.app, ["setup-sota", "--venv", str(tmp_path / "v")])
+    assert result.exit_code == 0, result.output
+    assert seen["venv"] == tmp_path / "v"
+    assert seen["default_venv"] == ".venv-uvr"
+
+
+def test_setup_sota_reports_failure(monkeypatch):
+    import stemforge.separate_uvr as uvr_mod
+
+    monkeypatch.setattr(uvr_mod, "setup_sota_env", lambda cfg, venv=None, log=print: False)
+    result = runner.invoke(cli.app, ["setup-sota"])
+    assert result.exit_code == 1

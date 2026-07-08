@@ -40,11 +40,15 @@ pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberban
 
 > Do **not** install the `midi-tf` extra unless you accept that it pulls TensorFlow and can break the torch CUDA stack. The default `midi` path is ONNX-only.
 
-Optional — SOTA separation (BS-Roformer & the UVR model zoo, no TensorFlow, reuses torch + onnxruntime-gpu):
+Optional — SOTA separation (BS-Roformer & the UVR model zoo) runs in an **isolated venv**:
 
 ```bash
-pip install "audio-separator[gpu]"     # or: pip install -e ".[separation-sota]"
+stemforge setup-sota      # one-time: creates .venv-uvr with CUDA torch + audio-separator[gpu]
 ```
+
+> Do **not** `pip install audio-separator` into the main env. On Windows/py3.11 it
+> replaced CUDA torch with a CPU-only build and bumped numpy, breaking the demucs GPU
+> stack — StemForge therefore calls it via subprocess from `.venv-uvr` only.
 
 ### 4. System binaries
 

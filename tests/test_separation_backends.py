@@ -1,18 +1,20 @@
-"""Presets + UVR/hybrid backend routing — GPU-free, audio_separator fully mocked."""
+"""Presets + UVR/hybrid backend routing — GPU-free; the audio-separator CLI
+subprocess is fully mocked (no venv creation, no model downloads in CI)."""
 
 from __future__ import annotations
 
+import subprocess
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
 
+from stemforge import separate_uvr
 from stemforge.io_utils import AudioTensor
 from stemforge.orchestrator import BS_ROFORMER_MODEL, Pipeline, load_config, preset_names
-from stemforge.separate_uvr import canonical_stem_name
+from stemforge.separate_uvr import SotaEnvError, canonical_stem_name
 
 
 # --------------------------------------------------------------------------- #
@@ -92,46 +94,31 @@ def test_canonical_stem_name(filename, expected):
 
 
 # --------------------------------------------------------------------------- #
-# Mocked audio_separator
+# Mocked audio-separator CLI subprocess (no venv, no downloads, no import)
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def fake_audio_separator(monkeypatch):
-    """Inject a fake `audio_separator` package; records calls, writes real WAVs."""
-    calls: dict = {"init_count": 0}
+def fake_uvr_cli(monkeypatch):
+    """Pretend the isolated venv exists and its CLI works: preflight passes and
+    `subprocess.run` writes real stem WAVs into --output_dir."""
+    calls: dict = {"cmds": []}
 
-    class FakeSeparator:
-        def __init__(self, output_dir=None, output_format="WAV", model_file_dir=None,
-                     use_autocast=False, demucs_params=None, **kwargs):
-            calls["init_count"] += 1
-            calls["init"] = dict(
-                output_dir=output_dir, output_format=output_format,
-                model_file_dir=model_file_dir, use_autocast=use_autocast,
-                demucs_params=demucs_params,
-            )
-            self.output_dir = output_dir
-            self.model = None
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(
+        separate_uvr, "find_cli", lambda venv_dir: Path(venv_dir) / "bin" / "audio-separator",
+    )
 
-        def load_model(self, model_filename=None):
-            calls["model"] = model_filename
-            self.model = model_filename
+    def fake_run(cmd, capture_output=False, text=False, check=False, **kwargs):
+        calls["cmds"].append([str(c) for c in cmd])
+        args = {cmd[i]: cmd[i + 1] for i in range(len(cmd) - 1)}
+        src = Path(str(cmd[1]))
+        out_dir = Path(str(args["--output_dir"]))
+        model = Path(str(args["--model_filename"])).stem
+        data, sr = sf.read(str(src), always_2d=True)
+        for token in ("Vocals", "Instrumental"):
+            sf.write(str(out_dir / f"{src.stem}_({token})_{model}.wav"), data * 0.5, sr)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        def separate(self, path):
-            calls.setdefault("inputs", []).append(path)
-            src = Path(path)
-            data, sr = sf.read(str(src), always_2d=True)
-            out = []
-            for token in ("Vocals", "Instrumental"):
-                name = f"{src.stem}_({token})_{Path(self.model).stem}.wav"
-                sf.write(str(Path(self.output_dir) / name), data * 0.5, sr)
-                out.append(name)  # relative to output_dir, like some versions
-            return out
-
-    pkg = types.ModuleType("audio_separator")
-    mod = types.ModuleType("audio_separator.separator")
-    mod.Separator = FakeSeparator
-    pkg.separator = mod
-    monkeypatch.setitem(sys.modules, "audio_separator", pkg)
-    monkeypatch.setitem(sys.modules, "audio_separator.separator", mod)
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
     return calls
 
 
@@ -143,9 +130,7 @@ def _base_overrides(tmp_path) -> dict:
     }
 
 
-def test_separate_uvr_maps_and_caches(fake_audio_separator, sine):
-    from stemforge import separate_uvr
-
+def test_separate_uvr_maps_and_caches(fake_uvr_cli, sine):
     samples, sr = sine
     audio = AudioTensor(samples, sr)
     cfg = load_config(overrides={"separation.preset": "sota"}).separation
@@ -154,31 +139,38 @@ def test_separate_uvr_maps_and_caches(fake_audio_separator, sine):
     assert set(stems) == {"vocals", "instrumental"}
     assert all(isinstance(v, AudioTensor) for v in stems.values())
     assert stems["vocals"].sample_rate == sr
-    assert fake_audio_separator["model"] == BS_ROFORMER_MODEL
-    assert fake_audio_separator["init"]["output_format"] == "WAV"
-    assert fake_audio_separator["init"]["model_file_dir"].endswith("models/uvr")
-    assert fake_audio_separator["init"]["use_autocast"] is True
-    assert fake_audio_separator["init"]["demucs_params"]["segment_size"] == "Default"
+
+    cmd = fake_uvr_cli["cmds"][0]
+    assert cmd[0].endswith("audio-separator")
+    assert cmd[cmd.index("--model_filename") + 1] == BS_ROFORMER_MODEL
+    assert cmd[cmd.index("--output_format") + 1] == "WAV"
+    assert cmd[cmd.index("--model_file_dir") + 1].endswith("models/uvr")
+    assert "--use_autocast" in cmd
 
     # scratch files are cleaned up after each call
     assert list(engine.work_dir.iterdir()) == []
 
-    # same model -> engine (and loaded weights) are reused, not rebuilt
+    # same model -> engine (and its preflight/scratch dir) is reused
     _, engine2 = separate_uvr.separate(audio, cfg, device="cpu", engine=engine)
     assert engine2 is engine
-    assert fake_audio_separator["init_count"] == 1
 
     # different model -> new engine
     cfg.uvr_model = "some_other_model.ckpt"
     _, engine3 = separate_uvr.separate(audio, cfg, device="cpu", engine=engine)
     assert engine3 is not engine
-    assert fake_audio_separator["init_count"] == 2
 
 
-def test_pipeline_uvr_backend(fake_audio_separator, tmp_path, sine_wav):
-    wav = sine_wav
+def test_no_in_process_audio_separator_import(fake_uvr_cli, sine):
+    """The whole point of the isolation: audio_separator never enters this process."""
+    samples, sr = sine
+    cfg = load_config(overrides={"separation.preset": "sota"}).separation
+    separate_uvr.separate(AudioTensor(samples, sr), cfg, device="cpu")
+    assert "audio_separator" not in sys.modules
+
+
+def test_pipeline_uvr_backend(fake_uvr_cli, tmp_path, sine_wav):
     cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "sota"})
-    m = Pipeline(cfg).run(wav)
+    m = Pipeline(cfg).run(sine_wav)
 
     sep = m["separation"]
     assert sep["backend"] == "uvr"
@@ -189,7 +181,7 @@ def test_pipeline_uvr_backend(fake_audio_separator, tmp_path, sine_wav):
     assert (out / "vocals.wav").is_file() and (out / "instrumental.wav").is_file()
 
 
-def test_pipeline_hybrid_backend(fake_audio_separator, monkeypatch, tmp_path, sine_wav):
+def test_pipeline_hybrid_backend(fake_uvr_cli, monkeypatch, tmp_path, sine_wav):
     import stemforge.separate as demucs_mod
 
     seen: dict = {}
@@ -203,9 +195,8 @@ def test_pipeline_hybrid_backend(fake_audio_separator, monkeypatch, tmp_path, si
 
     monkeypatch.setattr(demucs_mod, "separate", fake_demucs)
 
-    wav = sine_wav
     cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "max"})
-    m = Pipeline(cfg).run(wav)
+    m = Pipeline(cfg).run(sine_wav)
 
     sep = m["separation"]
     assert sep["backend"] == "hybrid"
@@ -217,29 +208,7 @@ def test_pipeline_hybrid_backend(fake_audio_separator, monkeypatch, tmp_path, si
     assert "model_bs_roformer" in sep["model"] and "htdemucs_ft" in sep["model"]
 
 
-def test_uvr_missing_dependency_fails_soft(monkeypatch, tmp_path, sine_wav):
-    """No audio-separator installed -> stage records a skip, run still completes."""
-    monkeypatch.setitem(sys.modules, "audio_separator", None)
-    monkeypatch.setitem(sys.modules, "audio_separator.separator", None)
-
-    wav = sine_wav
-    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "sota"})
-    m = Pipeline(cfg).run(wav)
-
-    assert "skipped" in m["separation"]
-    assert "audio-separator" in m["separation"]["skipped"]
-    assert (tmp_path / "out" / "in" / "manifest.json").is_file()
-
-
-def test_unknown_backend_recorded_as_error(tmp_path, sine_wav):
-    wav = sine_wav
-    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.backend": "spleeter"})
-    m = Pipeline(cfg).run(wav)
-    assert "error" in m["separation"]
-    assert "spleeter" in m["separation"]["error"]
-
-
-def test_hybrid_keeps_uvr_result_when_demucs_missing(fake_audio_separator, monkeypatch, tmp_path, sine_wav):
+def test_hybrid_keeps_uvr_result_when_demucs_missing(fake_uvr_cli, monkeypatch, tmp_path, sine_wav):
     """Hybrid must not throw away the finished roformer pass if demucs is absent."""
     import stemforge.separate as demucs_mod
 
@@ -256,6 +225,54 @@ def test_hybrid_keeps_uvr_result_when_demucs_missing(fake_audio_separator, monke
     assert any("demucs" in n for n in sep["notes"])
 
 
+# --------------------------------------------------------------------------- #
+# Preflight fail-soft (no venv / no ffmpeg) + runtime CLI failure
+# --------------------------------------------------------------------------- #
+def test_missing_venv_fails_soft_with_setup_hint(monkeypatch, tmp_path, sine_wav):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(separate_uvr, "find_cli", lambda venv_dir: None)
+
+    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "sota"})
+    m = Pipeline(cfg).run(sine_wav)
+
+    assert "setup-sota" in m["separation"]["skipped"]
+    assert (tmp_path / "out" / "in" / "manifest.json").is_file()
+
+
+def test_missing_ffmpeg_fails_soft(monkeypatch, tmp_path, sine_wav):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: False)
+
+    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "sota"})
+    m = Pipeline(cfg).run(sine_wav)
+
+    assert "ffmpeg" in m["separation"]["skipped"]
+
+
+def test_preflight_raises_sota_env_error(monkeypatch):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(separate_uvr, "find_cli", lambda venv_dir: None)
+    with pytest.raises(SotaEnvError, match="setup-sota"):
+        separate_uvr.preflight(load_config().separation)
+
+
+def test_cli_crash_is_an_error_not_a_skip(monkeypatch, tmp_path, sine_wav):
+    """A broken run inside a ready env is a real error (with stderr), not a skip."""
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(
+        separate_uvr, "find_cli", lambda venv_dir: Path(venv_dir) / "bin" / "audio-separator",
+    )
+
+    def failing_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="CUDA out of memory")
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", failing_run)
+    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "sota"})
+    m = Pipeline(cfg).run(sine_wav)
+
+    assert "error" in m["separation"] and "skipped" not in m["separation"]
+    assert "CUDA out of memory" in m["separation"]["error"]
+
+
 def test_non_dependency_import_error_is_an_error_not_a_skip(monkeypatch, tmp_path, sine_wav):
     """Only known optional backend deps fail soft; other MNFEs surface as errors."""
     import stemforge.separate as demucs_mod
@@ -269,3 +286,68 @@ def test_non_dependency_import_error_is_an_error_not_a_skip(monkeypatch, tmp_pat
 
     assert "error" in m["separation"] and "skipped" not in m["separation"]
     assert "einops" in m["separation"]["error"]
+
+
+def test_unknown_backend_recorded_as_error(tmp_path, sine_wav):
+    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.backend": "spleeter"})
+    m = Pipeline(cfg).run(sine_wav)
+    assert "error" in m["separation"]
+    assert "spleeter" in m["separation"]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# setup_sota_env — venv provisioning, mocked subprocess, idempotent
+# --------------------------------------------------------------------------- #
+def test_setup_sota_env_creates_venv_then_is_idempotent(monkeypatch, tmp_path):
+    venv_dir = tmp_path / ".venv-uvr"
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, check=False, **kwargs):
+        cmd = [str(c) for c in cmd]
+        cmds.append(cmd)
+        if cmd[1:3] == ["-m", "venv"]:  # python -m venv <dir>
+            bindir = Path(cmd[3]) / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
+            bindir.mkdir(parents=True, exist_ok=True)
+            (bindir / ("python.exe" if separate_uvr.os.name == "nt" else "python")).touch()
+        if "pip" in cmd and any("audio-separator" in c for c in cmd):
+            bindir = venv_dir / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
+            (bindir / "audio-separator").touch()
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    logs: list[str] = []
+
+    cfg = load_config().separation
+    assert separate_uvr.setup_sota_env(cfg, venv=venv_dir, log=logs.append) is True
+
+    # 1) venv created with THIS interpreter, 2) CUDA torch first, 3) then audio-separator
+    assert cmds[0][:3] == [sys.executable, "-m", "venv"]
+    torch_cmd, sep_cmd = cmds[1], cmds[2]
+    assert "torch" in torch_cmd and separate_uvr.TORCH_CU124_INDEX in torch_cmd
+    assert any("audio-separator" in c for c in sep_cmd)
+    # every pip install targets the VENV python, never the main interpreter
+    assert torch_cmd[0] == str(separate_uvr.venv_python(venv_dir))
+    assert sep_cmd[0] == str(separate_uvr.venv_python(venv_dir))
+
+    # second run: venv + CLI already present -> no subprocess work at all
+    cmds.clear()
+    assert separate_uvr.setup_sota_env(cfg, venv=venv_dir, log=logs.append) is True
+    assert cmds == []
+
+
+def test_setup_sota_env_reports_missing_ffmpeg(monkeypatch, tmp_path):
+    venv_dir = tmp_path / ".venv-uvr"
+    bindir = venv_dir / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
+    bindir.mkdir(parents=True)
+    (bindir / ("python.exe" if separate_uvr.os.name == "nt" else "python")).touch()
+    (bindir / "audio-separator").touch()
+
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: False)
+    monkeypatch.setattr(
+        separate_uvr.subprocess, "run",
+        lambda *a, **kw: pytest.fail("no subprocess expected when venv is complete"),
+    )
+    logs: list[str] = []
+    assert separate_uvr.setup_sota_env(load_config().separation, venv=venv_dir, log=logs.append) is False
+    assert any("ffmpeg" in line for line in logs)

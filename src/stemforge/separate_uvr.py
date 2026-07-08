@@ -1,29 +1,38 @@
-"""§5.3b separate_uvr — SOTA separation via `audio-separator` (UVR model zoo).
+"""§5.3b separate_uvr — SOTA separation via `audio-separator`, ISOLATED in its own venv.
 
-Wraps ``audio_separator.separator.Separator`` to run BS-Roformer / MDX / VR /
-Demucs checkpoints from the UVR ecosystem. audio-separator is imported lazily so
-``import stemforge`` (and pytest) never needs it; install with the
-``separation-sota`` extra (``pip install "audio-separator[gpu]"`` — reuses the
-existing torch + onnxruntime-gpu stack, NO TensorFlow).
+audio-separator (BS-Roformer / MDX / VR / the UVR model zoo) is run as a
+**subprocess** from a dedicated virtual environment (default
+``<project-root>/.venv-uvr``, configurable via ``separation.uvr_venv``) and is
+NEVER imported in-process. Hard-won reason (Windows / py3.11, 2026-07):
+``pip install "audio-separator[gpu]"`` into the main env pulled a **CPU-only
+torch 2.13.0+cpu** that replaced torch 2.6.0+cu124 and bumped numpy to 2.4.6,
+silently breaking the working demucs GPU stack. Isolation makes that
+structurally impossible — the main interpreter's packages are never touched.
 
-audio-separator is file-based: it reads an input path and writes stem files
-whose names carry a parenthesized stem token, e.g.
-``{track}_(Vocals)_{model}.wav`` / ``(Instrumental)`` / ``(Drums)`` /
-``(Bass)`` / ``(Other)``. We round-trip through a scratch directory and map
-those tokens back to canonical stem names, returning ``dict[str, AudioTensor]``
-like the Demucs backend. Models auto-download into ``cfg.uvr_model_dir`` on
-first load.
+Provision the venv with ``stemforge setup-sota`` (idempotent). Separation
+preflights the venv + ffmpeg and fails soft (manifest ``skipped`` + fix hint)
+when either is missing; it never creates the venv or downloads anything
+mid-pipeline.
+
+The CLI is file-based: it reads an input path and writes stem files whose
+names carry a parenthesized stem token — ``{track}_(Vocals)_{model}.wav`` /
+``(Instrumental)`` / ``(Drums)`` / ``(Bass)`` / ``(Other)`` — which we map back
+to canonical stem names and load as :class:`AudioTensor`. Models auto-download
+(inside the subprocess) into ``cfg.uvr_model_dir`` on first use.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .io_utils import AudioTensor, PathLike, ensure_dir, load_audio, save_audio, slugify
 
@@ -32,6 +41,10 @@ try:  # pragma: no cover - typing convenience
     from .orchestrator import SeparationCfg
 except Exception:  # pragma: no cover
     SeparationCfg = Any  # type: ignore
+
+#: What `stemforge setup-sota` installs into the ISOLATED venv (never the main env).
+AUDIO_SEPARATOR_SPEC = "audio-separator[gpu]>=0.44"
+TORCH_CU124_INDEX = "https://download.pytorch.org/whl/cu124"
 
 # Parenthesized stem token in audio-separator output filenames -> canonical name.
 _STEM_TOKEN_MAP = {
@@ -47,16 +60,22 @@ _STEM_TOKEN_MAP = {
 
 _TOKEN_RE = re.compile(r"\(([^()]+)\)")
 
-# Anchor for relative model dirs (same anchor as configs/ in orchestrator), so
-# the multi-hundred-MB checkpoint cache doesn't re-download per working dir.
+# Anchor for relative venv/model dirs (same anchor as configs/ in orchestrator),
+# so neither the venv nor the checkpoint cache is duplicated per working dir.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _resolve_model_dir(model_file_dir: str) -> str:
-    p = Path(model_file_dir).expanduser()
-    return str(p if p.is_absolute() else _PROJECT_ROOT / p)
+class SotaEnvError(RuntimeError):
+    """Preflight failure of the isolated audio-separator environment.
+
+    The orchestrator records this as a manifest ``skipped`` entry — a missing
+    venv or ffmpeg must never crash the run (and never mutate the main env).
+    """
 
 
+# --------------------------------------------------------------------------- #
+# Filename token mapping
+# --------------------------------------------------------------------------- #
 def canonical_stem_name(filename: PathLike) -> str:
     """Map an audio-separator output filename to a canonical stem name.
 
@@ -72,46 +91,144 @@ def canonical_stem_name(filename: PathLike) -> str:
     return slugify(stem).lower()
 
 
-class UvrEngine:
-    """A loaded audio-separator model plus its scratch output directory.
+# --------------------------------------------------------------------------- #
+# Isolated venv discovery / provisioning
+# --------------------------------------------------------------------------- #
+def resolve_venv_dir(venv: PathLike) -> Path:
+    p = Path(venv).expanduser()
+    return p if p.is_absolute() else _PROJECT_ROOT / p
 
-    audio-separator binds ``output_dir`` at model-load time, so the scratch dir
-    lives as long as the engine; per-call outputs are read back and deleted.
-    Cache an instance across a batch exactly like the Demucs model object.
+
+def _resolve_model_dir(model_file_dir: str) -> str:
+    p = Path(model_file_dir).expanduser()
+    return str(p if p.is_absolute() else _PROJECT_ROOT / p)
+
+
+def venv_python(venv_dir: Path) -> Path:
+    sub = "Scripts" if os.name == "nt" else "bin"
+    exe = "python.exe" if os.name == "nt" else "python"
+    return venv_dir / sub / exe
+
+
+def find_cli(venv_dir: Path) -> Path | None:
+    """Path of the venv's `audio-separator` console script, or None."""
+    sub = "Scripts" if os.name == "nt" else "bin"
+    for name in ("audio-separator.exe", "audio-separator"):
+        cli = venv_dir / sub / name
+        if cli.exists():
+            return cli
+    return None
+
+
+def have_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def setup_sota_env(cfg: "SeparationCfg", venv: PathLike | None = None,
+                   log: Callable[[str], None] = print) -> bool:
+    """Create/repair the isolated audio-separator venv. Idempotent.
+
+    Installs CUDA-matched torch/torchaudio FIRST (cu124 index), then
+    audio-separator — into the venv ONLY. The main interpreter's packages are
+    never touched. Returns True when the venv is ready.
+    """
+    venv_dir = resolve_venv_dir(venv or cfg.uvr_venv)
+    py = venv_python(venv_dir)
+
+    if py.exists():
+        log(f"venv present: {venv_dir}")
+    else:
+        log(f"creating venv: {venv_dir}")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        if not venv_python(venv_dir).exists():
+            log("venv creation did not produce a python executable")
+            return False
+
+    cli = find_cli(venv_dir)
+    if cli is None:
+        py = venv_python(venv_dir)
+        log(f"installing CUDA torch ({TORCH_CU124_INDEX}) into the venv — this can take a while")
+        subprocess.run(
+            [str(py), "-m", "pip", "install", "torch", "torchaudio",
+             "--index-url", TORCH_CU124_INDEX],
+            check=True,
+        )
+        log(f"installing {AUDIO_SEPARATOR_SPEC} into the venv")
+        subprocess.run([str(py), "-m", "pip", "install", AUDIO_SEPARATOR_SPEC], check=True)
+        cli = find_cli(venv_dir)
+        if cli is None:
+            log("install finished but the audio-separator CLI was not found in the venv")
+            return False
+    log(f"audio-separator CLI: {cli}")
+
+    if have_ffmpeg():
+        log("ffmpeg: ok")
+    else:
+        log("ffmpeg: NOT on PATH — install it (apt/brew/choco install ffmpeg)")
+        return False
+    return True
+
+
+def preflight(cfg: "SeparationCfg") -> Path:
+    """Verify the isolated env is usable; return the CLI path.
+
+    Raises :class:`SotaEnvError` (fail-soft at the orchestrator) — never
+    creates the venv and never installs anything.
+    """
+    if not have_ffmpeg():
+        raise SotaEnvError("ffmpeg not on PATH (install ffmpeg, e.g. `apt install ffmpeg`)")
+    venv_dir = resolve_venv_dir(cfg.uvr_venv)
+    cli = find_cli(venv_dir)
+    if cli is None:
+        raise SotaEnvError(
+            f"audio-separator venv not ready at {venv_dir} (run `stemforge setup-sota`)"
+        )
+    return cli
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess-backed engine
+# --------------------------------------------------------------------------- #
+class UvrEngine:
+    """A preflighted isolated-venv CLI runner plus its scratch output directory.
+
+    Holds no model in-process — the checkpoint lives inside the subprocess —
+    but caching an instance across a batch still skips repeated preflights and
+    scratch-dir churn. Mirrors the ``(stems, engine)`` contract of the demucs
+    backend.
     """
 
     def __init__(self, cfg: "SeparationCfg", work_dir: PathLike | None = None):
-        from audio_separator.separator import Separator  # lazy: optional dep
-
+        self.cli = preflight(cfg)
         self.model_filename: str = cfg.uvr_model
+        self.model_file_dir: str = _resolve_model_dir(cfg.uvr_model_dir)
+        self.use_autocast: bool = cfg.uvr_use_autocast
         owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="stemforge-uvr-"))
         ensure_dir(self.work_dir)
         if owns_work_dir:  # remove the scratch dir when the engine is collected
             self._cleanup = weakref.finalize(self, shutil.rmtree, str(self.work_dir), True)
-        self.separator = Separator(
-            output_dir=str(self.work_dir),
-            output_format="WAV",
-            model_file_dir=_resolve_model_dir(cfg.uvr_model_dir),
-            use_autocast=cfg.uvr_use_autocast,
-            demucs_params={
-                "shifts": cfg.shifts,
-                "overlap": cfg.overlap,
-                "segment_size": "Default",
-            },
-        )
-        self.separator.load_model(model_filename=cfg.uvr_model)
 
     def separate_file(self, path: PathLike) -> dict[str, Path]:
-        """Run the loaded model on an audio file; return canonical name -> path."""
-        produced = self.separator.separate(str(path))
-        out: dict[str, Path] = {}
-        for f in produced:
-            p = Path(f)
-            if not p.is_absolute():  # some versions return names relative to output_dir
-                p = self.work_dir / p
-            out[canonical_stem_name(p.name)] = p
-        return out
+        """Run the venv CLI on an audio file; return canonical name -> path."""
+        before = {p for p in self.work_dir.iterdir()}
+        cmd = [
+            str(self.cli), str(path),
+            "--model_filename", self.model_filename,
+            "--output_dir", str(self.work_dir),
+            "--output_format", "WAV",
+            "--model_file_dir", self.model_file_dir,
+        ]
+        if self.use_autocast:
+            cmd.append("--use_autocast")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
+            raise RuntimeError(
+                f"audio-separator exited with {proc.returncode}: " + " | ".join(tail)
+            )
+        produced = sorted(p for p in self.work_dir.iterdir() if p not in before and p.is_file())
+        return {canonical_stem_name(p.name): p for p in produced}
 
 
 def separate(
@@ -120,12 +237,12 @@ def separate(
     device: str = "cuda",
     engine: UvrEngine | None = None,
 ) -> tuple[dict[str, AudioTensor], UvrEngine]:
-    """Separate ``audio`` with a UVR-family model.
+    """Separate ``audio`` with a UVR-family model in the isolated venv.
 
     Returns ``(stems, engine)`` — the engine is returned so the caller can cache
-    the loaded model across a batch, mirroring :func:`stemforge.separate.separate`.
+    it across a batch, mirroring :func:`stemforge.separate.separate`.
     ``device`` is accepted for backend-signature parity; audio-separator picks
-    CUDA automatically when available.
+    CUDA automatically inside its own venv.
     """
     if engine is None or engine.model_filename != cfg.uvr_model:
         engine = UvrEngine(cfg)
