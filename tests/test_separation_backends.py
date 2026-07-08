@@ -3,6 +3,7 @@ subprocess is fully mocked (no venv creation, no model downloads in CI)."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -298,56 +299,122 @@ def test_unknown_backend_recorded_as_error(tmp_path, sine_wav):
 # --------------------------------------------------------------------------- #
 # setup_sota_env — venv provisioning, mocked subprocess, idempotent
 # --------------------------------------------------------------------------- #
-def test_setup_sota_env_creates_venv_then_is_idempotent(monkeypatch, tmp_path):
-    venv_dir = tmp_path / ".venv-uvr"
-    cmds: list[list[str]] = []
+def _bindir(venv_dir: Path) -> Path:
+    return venv_dir / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
 
-    def fake_run(cmd, check=False, **kwargs):
+
+def _touch_python(venv_dir: Path) -> None:
+    b = _bindir(venv_dir)
+    b.mkdir(parents=True, exist_ok=True)
+    (b / ("python.exe" if separate_uvr.os.name == "nt" else "python")).touch()
+
+
+def _stateful_pip_mock(venv_dir: Path, cmds: list, state: dict):
+    """Mock subprocess.run modeling: audio-separator downgrades torch to +cpu;
+    the force-reinstall restores +cu124; `python -c` probes report `state`."""
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
         cmd = [str(c) for c in cmd]
         cmds.append(cmd)
-        if cmd[1:3] == ["-m", "venv"]:  # python -m venv <dir>
-            bindir = Path(cmd[3]) / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
-            bindir.mkdir(parents=True, exist_ok=True)
-            (bindir / ("python.exe" if separate_uvr.os.name == "nt" else "python")).touch()
-        if "pip" in cmd and any("audio-separator" in c for c in cmd):
-            bindir = venv_dir / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
-            (bindir / "audio-separator").touch()
+        if cmd[1:3] == ["-m", "venv"]:
+            _touch_python(Path(cmd[3]))
+        elif "--force-reinstall" in cmd:
+            state["torch"] = "2.6.0+cu124"
+        elif "pip" in cmd and any("audio-separator" in c for c in cmd):
+            (_bindir(venv_dir) / "audio-separator").touch()
+            state["torch"] = "2.13.0+cpu"  # audio-separator's deps clobber torch
+        elif "pip" in cmd and "torch" in cmd:
+            state["torch"] = "2.6.0+cu124"
+        elif cmd[1:2] == ["-c"]:  # torch status probe
+            if state["torch"] is None:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no torch")
+            cuda = "+cu" in state["torch"]
+            payload = json.dumps({
+                "version": state["torch"], "cuda": cuda,
+                "name": "Mock RTX 4090" if cuda else None,
+            })
+            return subprocess.CompletedProcess(cmd, 0, stdout=payload + "\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    return fake_run
+
+
+def test_setup_sota_env_creates_venv_forces_cuda_torch_and_is_idempotent(monkeypatch, tmp_path):
+    venv_dir = tmp_path / ".venv-uvr"
+    cmds: list[list[str]] = []
+    state = {"torch": None}
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", _stateful_pip_mock(venv_dir, cmds, state))
     monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
     logs: list[str] = []
 
     cfg = load_config().separation
     assert separate_uvr.setup_sota_env(cfg, venv=venv_dir, log=logs.append) is True
 
-    # 1) venv created with THIS interpreter, 2) CUDA torch first, 3) then audio-separator
-    assert cmds[0][:3] == [sys.executable, "-m", "venv"]
-    torch_cmd, sep_cmd = cmds[1], cmds[2]
-    assert "torch" in torch_cmd and separate_uvr.TORCH_CU124_INDEX in torch_cmd
-    assert any("audio-separator" in c for c in sep_cmd)
+    installs = [c for c in cmds if "pip" in c and "install" in c]
+    # order: CUDA torch first, then audio-separator, then the cu124 force-reinstall LAST
+    assert "torch" in installs[0] and separate_uvr.TORCH_CU124_INDEX in installs[0]
+    assert any("audio-separator" in c for c in installs[1])
+    assert "--force-reinstall" in installs[-1] and "--no-deps" in installs[-1]
+    assert separate_uvr.TORCH_CU124_INDEX in installs[-1]
+    # the force-reinstall runs AFTER the audio-separator install
+    assert "torch" in installs[-1]
+    assert cmds.index(installs[-1]) > cmds.index(installs[1])
     # every pip install targets the VENV python, never the main interpreter
-    assert torch_cmd[0] == str(separate_uvr.venv_python(venv_dir))
-    assert sep_cmd[0] == str(separate_uvr.venv_python(venv_dir))
+    assert all(c[0] == str(separate_uvr.venv_python(venv_dir)) for c in installs)
+    # verified CUDA in the venv and surfaced the GPU name
+    assert any("Mock RTX 4090" in line for line in logs)
 
-    # second run: venv + CLI already present -> no subprocess work at all
+    # second run: venv + CLI present, torch already +cu124 -> NO installs at all
     cmds.clear()
     assert separate_uvr.setup_sota_env(cfg, venv=venv_dir, log=logs.append) is True
-    assert cmds == []
+    assert [c for c in cmds if "pip" in c and "install" in c] == []
+
+
+def test_setup_sota_env_cuda_reinstall_failsoft(monkeypatch, tmp_path):
+    """A failed cu124 reinstall warns but never crashes; setup still succeeds."""
+    venv_dir = tmp_path / ".venv-uvr"
+    _touch_python(venv_dir)
+    (_bindir(venv_dir) / "audio-separator").touch()  # CLI already present
+
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
+        cmd = [str(c) for c in cmd]
+        if "--force-reinstall" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+        if cmd[1:2] == ["-c"]:  # torch present but CPU-only -> triggers a reinstall attempt
+            payload = json.dumps({"version": "2.13.0+cpu", "cuda": False, "name": None})
+            return subprocess.CompletedProcess(cmd, 0, stdout=payload + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    logs: list[str] = []
+
+    assert separate_uvr.setup_sota_env(load_config().separation, venv=venv_dir, log=logs.append) is True
+    assert any("WARNING" in line and "CPU" in line for line in logs)
+
+
+def test_venv_torch_status_none_when_absent(tmp_path):
+    """No venv python -> None, no crash (doctor tolerates it)."""
+    assert separate_uvr.venv_torch_status(tmp_path / "nope") is None
 
 
 def test_setup_sota_env_reports_missing_ffmpeg(monkeypatch, tmp_path):
     venv_dir = tmp_path / ".venv-uvr"
-    bindir = venv_dir / ("Scripts" if separate_uvr.os.name == "nt" else "bin")
-    bindir.mkdir(parents=True)
-    (bindir / ("python.exe" if separate_uvr.os.name == "nt" else "python")).touch()
-    (bindir / "audio-separator").touch()
+    _touch_python(venv_dir)
+    (_bindir(venv_dir) / "audio-separator").touch()
 
     monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: False)
-    monkeypatch.setattr(
-        separate_uvr.subprocess, "run",
-        lambda *a, **kw: pytest.fail("no subprocess expected when venv is complete"),
-    )
+
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
+        cmd = [str(c) for c in cmd]
+        if "install" in cmd:
+            pytest.fail("no pip install expected when the venv is complete")
+        if cmd[1:2] == ["-c"]:  # already a CUDA build -> no reinstall
+            payload = json.dumps({"version": "2.6.0+cu124", "cuda": True, "name": "Mock GPU"})
+            return subprocess.CompletedProcess(cmd, 0, stdout=payload + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(separate_uvr.subprocess, "run", fake_run)
     logs: list[str] = []
     assert separate_uvr.setup_sota_env(load_config().separation, venv=venv_dir, log=logs.append) is False
     assert any("ffmpeg" in line for line in logs)

@@ -110,7 +110,7 @@ def doctor() -> None:
             t.add_row(mod, "[yellow]not installed[/]")
 
     # audio-separator lives in its OWN venv (never imported in-process)
-    from .separate_uvr import find_cli, resolve_venv_dir
+    from .separate_uvr import find_cli, resolve_venv_dir, venv_torch_status
 
     venv_dir = resolve_venv_dir(load_config().separation.uvr_venv)
     cli_path = find_cli(venv_dir)
@@ -118,6 +118,14 @@ def doctor() -> None:
         "audio-separator (isolated venv)",
         f"[green]ok[/] · {cli_path}" if cli_path else "[yellow]not set up — run `stemforge setup-sota`[/]",
     )
+    if cli_path:
+        ts = venv_torch_status(venv_dir)
+        if ts is None:
+            t.add_row(".venv-uvr torch", "[yellow]not importable[/]")
+        elif ts.get("cuda"):
+            t.add_row(".venv-uvr torch", f"{ts.get('version')} · [green]CUDA[/] · {ts.get('name')}")
+        else:
+            t.add_row(".venv-uvr torch", f"{ts.get('version')} · [yellow]CPU only — re-run `stemforge setup-sota`[/]")
 
     for name in ("ffmpeg", "rubberband"):
         t.add_row(name, "[green]ok[/]" if shutil.which(name) else "[yellow]not on PATH[/]")
@@ -228,11 +236,32 @@ def ui(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(7860),
     share: bool = typer.Option(False, "--share", help="Create a public Gradio link."),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the app in a browser once the server is up."
+    ),
 ) -> None:
     """Launch the local Gradio web app."""
     from .app import launch
 
-    launch(host=host, port=port, share=share)
+    launch(host=host, port=port, share=share, open_browser=open_browser)
+
+
+@app.command("desktop-shortcut")
+def desktop_shortcut() -> None:
+    """Create a double-clickable Desktop shortcut that launches the UI.
+
+    Windows -> a .lnk (via PowerShell); macOS -> a .command; Linux -> a
+    .desktop entry. Each runs the bundled launcher, which prepends the tool
+    dirs (ffmpeg / winget Links) to PATH before starting the UI.
+    """
+    from .desktop import create_shortcut
+
+    path = create_shortcut(log=console.print)
+    if path:
+        console.print(f"[green]Desktop shortcut created[/] — double-click {path.name} to launch StemForge.")
+    else:
+        console.print("[red]could not create a desktop shortcut[/] (see the message above)")
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

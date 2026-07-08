@@ -43,8 +43,13 @@ pip install -e ".[all]"        # demucs, beat_this, onnxruntime-gpu, pyrubberban
 Optional — SOTA separation (BS-Roformer & the UVR model zoo) runs in an **isolated venv**:
 
 ```bash
-stemforge setup-sota      # one-time: creates .venv-uvr with CUDA torch + audio-separator[gpu]
+stemforge setup-sota      # one-time: .venv-uvr with CUDA torch + audio-separator[gpu]
+stemforge doctor          # shows the .venv-uvr torch version + CUDA state
 ```
+
+`setup-sota` installs audio-separator, then **force-reinstalls the cu124 torch
+last** (audio-separator's deps otherwise pull a CPU torch — the reason SOTA once
+ran on CPU) and verifies `torch.cuda.is_available()` inside the venv.
 
 > Do **not** `pip install audio-separator` into the main env. On Windows/py3.11 it
 > replaced CUDA torch with a CPU-only build and bumped numpy, breaking the demucs GPU
@@ -90,9 +95,24 @@ stemforge run song.wav \
   --preset max --target-bpm 120 \
   --midi --drum-split --drum-midi --stretch -o out/
 
-# Launch the local web UI
+# Launch the local web UI (opens your browser automatically)
 stemforge ui
 ```
+
+### Launch the app
+
+```bash
+stemforge ui                 # start the web UI and open the browser
+stemforge ui --no-open       # start it without opening a browser
+stemforge desktop-shortcut   # create a double-clickable Desktop launcher
+```
+
+`stemforge desktop-shortcut` drops a native launcher on your Desktop — a `.lnk`
+on Windows, a `.command` on macOS, a `.desktop` entry on Linux. Double-click it
+to start StemForge; it prepends ffmpeg (the winget Links dir on Windows) and the
+repo to `PATH` first, so the app and the isolated `.venv-uvr` resolve. The same
+logic lives in `scripts/launch_ui.bat` (Windows) and `scripts/launch_ui.sh`
+(macOS/Linux) if you'd rather run a script directly.
 
 Every run writes a per-song bundle:
 

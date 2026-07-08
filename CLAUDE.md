@@ -55,8 +55,14 @@ the working demucs GPU stack. Isolation makes the clobber structurally
 impossible; the main interpreter's packages are never touched.
 
 - Provision with **`stemforge setup-sota`** (idempotent): creates the venv,
-  installs CUDA torch from the cu124 index FIRST, then `audio-separator[gpu]`
-  — into that venv ONLY. `stemforge doctor` shows the venv status.
+  installs CUDA torch from the cu124 index FIRST, then `audio-separator[gpu]`,
+  then **force-reinstalls the cu124 torch LAST** (`--force-reinstall --no-deps`)
+  because audio-separator's deps otherwise leave a **CPU torch** behind (that's
+  why `--preset max` once ran on CPU). It then probes `torch.cuda.is_available()`
+  *inside the venv* and prints the GPU name — into that venv ONLY. The
+  force-reinstall is fail-soft (warns, never crashes) and skipped when torch is
+  already a `+cu` build (idempotent). `stemforge doctor` shows the venv status
+  **plus the `.venv-uvr` torch version + CUDA state** (`separate_uvr.venv_torch_status`).
 - `separate_uvr.preflight()` verifies ffmpeg + the venv CLI before every run
   and raises `SotaEnvError` → the orchestrator records `{"skipped": ...}` with
   a one-line fix hint. Separation never creates the venv or downloads anything.
@@ -96,11 +102,23 @@ pip install --no-deps basic-pitch
 pip install "resampy<0.4.3" scikit-learn mir_eval
 
 # 4. SOTA separation (BS-Roformer / UVR zoo) — ISOLATED venv, never the main env:
-stemforge setup-sota      # creates .venv-uvr with CUDA torch + audio-separator[gpu]
+stemforge setup-sota      # .venv-uvr: CUDA torch + audio-separator[gpu], cu124 torch forced LAST
 # (do NOT `pip install audio-separator` into the main env — it clobbers CUDA torch/numpy)
 
 # 5. System binaries: ffmpeg + rubberband (apt/brew/choco)
 ```
+
+## Launch the app
+
+- **CLI:** `stemforge ui` starts Gradio and (by default) opens the browser via
+  gradio's `inbrowser=True`; `--no-open` suppresses it (`app.launch(open_browser=…)`).
+- **Double-click:** `stemforge desktop-shortcut` drops a Desktop launcher —
+  a `.lnk` on Windows (PowerShell `WScript.Shell.CreateShortcut`), `.command`
+  on macOS, `.desktop` on Linux (`src/stemforge/desktop.py`). It points at the
+  committed `scripts/launch_ui.{bat,sh}`, which **prepend** the winget Links dir
+  (`%LOCALAPPDATA%\Microsoft\WinGet\Links`, for ffmpeg) and the repo dir to PATH,
+  then run `python -m stemforge.cli ui`. Keeping the PATH-prepend in the scripts
+  (not the shortcut) means both the double-click and the raw scripts behave the same.
 
 ## Gotchas (hard-won — do not regress)
 

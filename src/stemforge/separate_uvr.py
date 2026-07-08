@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import shutil
 import subprocess
 import sys
@@ -124,13 +125,87 @@ def have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def venv_torch_status(venv_dir: Path) -> dict | None:
+    """Report the venv's torch build by running a probe inside it.
+
+    Returns ``{"version", "cuda", "name"}`` or ``None`` if torch is absent /
+    not importable. Runs in the isolated interpreter — never imports torch here.
+    """
+    py = venv_python(venv_dir)
+    if not py.exists():
+        return None
+    code = (
+        "import json, torch;"
+        "print(json.dumps({"
+        "'version': torch.__version__,"
+        "'cuda': torch.cuda.is_available(),"
+        "'name': (torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+        "}))"
+    )
+    try:
+        proc = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _ensure_cuda_torch(venv_dir: Path, log: Callable[[str], None]) -> None:
+    """Force a CUDA torch build to win in the venv.
+
+    audio-separator's dependency resolution downgrades torch to a CPU wheel
+    (``+cpu``), which is why ``--preset max`` ran on CPU. We reinstall the cu124
+    build LAST with ``--force-reinstall --no-deps`` so nothing re-drags a CPU
+    torch back in. Idempotent (skips when torch is already a ``+cu`` build) and
+    fail-soft (a failed reinstall warns, never raises).
+    """
+    status = venv_torch_status(venv_dir)
+    if status and "+cu" in str(status.get("version", "")):
+        _log_torch(status, log)  # already a CUDA build -> nothing to do
+        return
+
+    log("forcing CUDA torch to win in the venv (audio-separator downgraded it to CPU)")
+    py = venv_python(venv_dir)
+    try:
+        subprocess.run(
+            [str(py), "-m", "pip", "install", "--force-reinstall", "--no-deps",
+             "torch", "torchaudio", "--index-url", TORCH_CU124_INDEX],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        log(f"WARNING: could not reinstall CUDA torch ({e}); SOTA separation may run on CPU")
+        return
+
+    status = venv_torch_status(venv_dir)
+    if status is None:
+        log("WARNING: torch not importable in the venv after reinstall")
+    else:
+        _log_torch(status, log)
+
+
+def _log_torch(status: dict, log: Callable[[str], None]) -> None:
+    version = status.get("version", "?")
+    if status.get("cuda"):
+        log(f"venv torch: {version} · CUDA available · {status.get('name')}")
+    else:
+        log(f"venv torch: {version} · CUDA NOT available at runtime "
+            "(check the GPU driver / `nvidia-smi`)")
+
+
 def setup_sota_env(cfg: "SeparationCfg", venv: PathLike | None = None,
                    log: Callable[[str], None] = print) -> bool:
     """Create/repair the isolated audio-separator venv. Idempotent.
 
     Installs CUDA-matched torch/torchaudio FIRST (cu124 index), then
-    audio-separator — into the venv ONLY. The main interpreter's packages are
-    never touched. Returns True when the venv is ready.
+    audio-separator, then force-reinstalls the cu124 torch LAST so
+    audio-separator's deps can't leave a CPU torch behind — into the venv ONLY.
+    The main interpreter's packages are never touched. Returns True when the
+    venv is ready (CLI present + ffmpeg on PATH); a CPU-only GPU state warns but
+    does not fail.
     """
     venv_dir = resolve_venv_dir(venv or cfg.uvr_venv)
     py = venv_python(venv_dir)
@@ -160,6 +235,9 @@ def setup_sota_env(cfg: "SeparationCfg", venv: PathLike | None = None,
             log("install finished but the audio-separator CLI was not found in the venv")
             return False
     log(f"audio-separator CLI: {cli}")
+
+    # LAST: make sure the CUDA torch build wins over audio-separator's CPU downgrade.
+    _ensure_cuda_torch(venv_dir, log)
 
     if have_ffmpeg():
         log("ffmpeg: ok")
