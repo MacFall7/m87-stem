@@ -144,7 +144,9 @@ class DrumSplitCfg:
     parts: list[str] = field(default_factory=lambda: ["kick", "snare", "toms", "other"])
     from_input: bool = False  # tear down the raw input loop instead of the separated drums stem
     # inagoy/drumsep (default): a Demucs checkpoint run in the MAIN env, auto-downloaded.
-    inagoy_url: str = "https://huggingface.co/mnstrmnl/drumsep/resolve/main/drumsep.th"
+    # Public, non-gated mirror of the exact inagoy checkpoint (MIT); the old
+    # mnstrmnl/drumsep URL is now gated and returns HTTP 401.
+    inagoy_url: str = "https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th"
     inagoy_model_dir: str = "models/drumsep"
     # uvr drum path (isolated venv) — kept as an option; audio-separator has no per-hit model.
     uvr_model: str | None = None

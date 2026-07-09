@@ -71,6 +71,15 @@ function renderQuality() {
   }
 }
 
+// Show/hide a control block. Sets inline display too: the `.ctrl { display:flex }`
+// author rule outranks the UA `[hidden]{display:none}`, so the `hidden` attribute
+// alone would NOT hide it — inline display is what actually scopes controls.
+function showCtrl(id, show) {
+  const el = $(id);
+  el.hidden = !show;
+  el.style.display = show ? "" : "none";
+}
+
 function selectWorkflow(id) {
   state.wf = id;
   const wf = WORKFLOWS[id];
@@ -78,9 +87,10 @@ function selectWorkflow(id) {
   $("wf-sub").textContent = wf.sub;
   $("dz-title").textContent = wf.dz;
   $("run-btn").textContent = wf.cta;
-  $("ctrl-quality").hidden = !wf.quality;
-  $("ctrl-melodic").hidden = !wf.melodic;
-  $("ctrl-matchbpm").hidden = !wf.matchbpm;
+  // Each panel shows ONLY its own controls.
+  showCtrl("ctrl-quality", !!wf.quality);   // Extract Stems + Full Teardown
+  showCtrl("ctrl-melodic", !!wf.melodic);    // Melodic → MIDI
+  showCtrl("ctrl-matchbpm", !!wf.matchbpm);  // Match BPM (Drum Teardown: none)
   $("results").hidden = true;
   $("head-meta").hidden = true;
   if (wf.matchbpm) {
