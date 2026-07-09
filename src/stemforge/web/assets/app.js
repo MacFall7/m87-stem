@@ -1,4 +1,4 @@
-/* M87 · StemForge — single-page workstation (vanilla JS, no build step). */
+/* StemForge — single-page workstation (vanilla JS, no build step). */
 "use strict";
 
 const WORKFLOWS = {

@@ -285,10 +285,10 @@ def ui(
         True, "--open/--no-open", help="Open the app in a browser once the server is up."
     ),
 ) -> None:
-    """Launch the M87 workstation (bespoke FastAPI web app, served by uvicorn)."""
+    """Launch the StemForge workstation (bespoke FastAPI web app, served by uvicorn)."""
     from .webapp import launch
 
-    console.print(f"[green]M87 · StemForge[/] → http://{host}:{port}/")
+    console.print(f"[green]StemForge[/] → http://{host}:{port}/")
     launch(host=host, port=port, open_browser=open_browser)
 
 
