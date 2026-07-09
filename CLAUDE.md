@@ -59,7 +59,26 @@ resolves in `load_config` with precedence **yaml < preset < dotted overrides**
 | `fast` | demucs  | `htdemucs`, shifts=1 |
 | `best` | demucs  | `htdemucs_ft`, shifts=2 |
 | `sota` | uvr     | BS-Roformer `model_bs_roformer_ep_317_sdr_12.9755.ckpt` (2-stem: vocals + instrumental) |
-| `max`  | hybrid  | BS-Roformer vocals + `htdemucs_ft` on the instrumental residual → merged 4-stem (vocals/drums/bass/other) |
+| `max`  | hybrid  | **real vocal ensemble** (`uvr_max_spec` over `ENSEMBLE_VOCALS`) + `htdemucs_ft` on the instrumental residual → merged 4-stem |
+
+### Ensembles (Max)
+
+`separation.ensemble_enabled` + `separation.ensemble_models` (list) +
+`separation.uvr_ensemble_algorithm` (default `uvr_max_spec`) run
+audio-separator's **native ensemble** inside the venv subprocess —
+`UvrEngine.run` emits `-m <primary> --extra_models <m2 …> --ensemble_algorithm
+<algo>` (`separate_uvr.ensemble_spec` resolves primary/extras/algorithm).
+Verified sets (constants in `orchestrator.py`, all in audio-separator's own
+`models.json` + `ensemble_presets.json`):
+- `ENSEMBLE_VOCALS` = `bs_roformer_vocals_resurrection_unwa.ckpt` +
+  `melband_roformer_big_beta6x.ckpt` (preset `vocal_balanced`) — the Max default.
+- `ENSEMBLE_INSTRUMENTAL` = `melband_roformer_inst_v1e_plus.ckpt` +
+  `mel_band_roformer_instrumental_becruily.ckpt` (preset `instrumental_full`, inst SDR ~17.55).
+
+**Zero-regression default:** `_separate_hybrid` catches `SotaEnvError`/`RuntimeError`
+from the UVR stage and **degrades Max to a full demucs 4-stem** (with a manifest
+`notes` entry), so a missing venv or a gated/failed ensemble download never
+errors the run.
 
 ## audio-separator isolation (CRITICAL — do not regress)
 
@@ -140,9 +159,19 @@ installed `demucs` package (it's a Demucs checkpoint — no venv, GPU-fast).
   manifest `skipped` with a fix hint; a runtime apply failure → `error`. Never
   crashes, never mutates anything.
 
-`backend: uvr` still exists (isolated `.venv-uvr`, `separate_uvr.separate_drums`,
-`--list_filter=drums` discovery) but is not the default and produces kit
-isolation, not per-hit stems.
+`backend: uvr_drumsep` (option, not default) runs the **MDX23C per-hit DrumSep**
+model (`MDX23C-DrumSep-aufr33-jarredou.ckpt`, in audio-separator's registry)
+through the isolated `.venv-uvr` subprocess — no torch-2.6 hack, no gated demucs
+checkpoint. It pins the model (no `--list_filter` discovery) and keeps **all**
+recognized hits (`keep_all`). It is NOT the default only because its `.ckpt`
+couldn't be download-verified in the build env (the CI proxy blocks GitHub
+release assets, where audio-separator hosts *every* UVR model incl. the current
+sota/max BS-Roformer); it resolves on an open network. The MelBand-Roformer drum
+model is intentionally NOT wired — it is not in audio-separator's registry (needs
+the separate MSST framework); left as a code comment for the future.
+
+`backend: uvr` still exists (isolated `.venv-uvr`, `--list_filter=drums`
+discovery) but produces kit isolation, not per-hit stems.
 
 ## Verified install recipe (order matters)
 

@@ -340,6 +340,19 @@ def preflight(cfg: "SeparationCfg") -> Path:
     return cli
 
 
+def ensemble_spec(cfg: Any) -> tuple[str, list[str], str | None]:
+    """Resolve ``(primary_model, extra_models, algorithm)`` from a cfg.
+
+    When ``ensemble_enabled`` and ≥2 ``ensemble_models`` are set, returns the
+    first as primary + the rest as extras + the ensemble algorithm; otherwise a
+    single ``(uvr_model, [], None)``.
+    """
+    models = list(getattr(cfg, "ensemble_models", []) or [])
+    if getattr(cfg, "ensemble_enabled", False) and len(models) >= 2:
+        return models[0], models[1:], getattr(cfg, "uvr_ensemble_algorithm", "uvr_max_spec")
+    return cfg.uvr_model, [], None
+
+
 # --------------------------------------------------------------------------- #
 # Subprocess-backed engine
 # --------------------------------------------------------------------------- #
@@ -353,11 +366,14 @@ class UvrEngine:
     """
 
     def __init__(self, cli: Path, model_filename: str, model_file_dir: str,
-                 use_autocast: bool = True, work_dir: PathLike | None = None):
+                 use_autocast: bool = True, work_dir: PathLike | None = None,
+                 extra_models: list[str] | None = None, ensemble_algorithm: str | None = None):
         self.cli = cli
         self.model_filename = model_filename
         self.model_file_dir = model_file_dir
         self.use_autocast = use_autocast
+        self.extra_models = list(extra_models or [])          # ensemble: extra models beyond primary
+        self.ensemble_algorithm = ensemble_algorithm          # e.g. uvr_max_spec
         owns_work_dir = work_dir is None
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="stemforge-uvr-"))
         ensure_dir(self.work_dir)
@@ -368,18 +384,25 @@ class UvrEngine:
     def from_cfg(cls, cfg: Any, model_filename: str | None = None,
                  work_dir: PathLike | None = None) -> "UvrEngine":
         """Build a preflighted engine from any cfg exposing the ``uvr_*`` fields
-        (``SeparationCfg`` or ``DrumSplitCfg``). ``model_filename`` overrides
-        ``cfg.uvr_model`` (used when a drum model is auto-discovered)."""
+        (``SeparationCfg`` or ``DrumSplitCfg``). ``model_filename`` overrides the
+        resolved primary (used when a drum model is auto-discovered/pinned)."""
+        primary, extra, algo = ensemble_spec(cfg)
         return cls(
             cli=preflight(cfg),
-            model_filename=model_filename or cfg.uvr_model,
+            model_filename=model_filename or primary,
             model_file_dir=_resolve_model_dir(cfg.uvr_model_dir),
             use_autocast=getattr(cfg, "uvr_use_autocast", True),
             work_dir=work_dir,
+            extra_models=[] if model_filename else extra,
+            ensemble_algorithm=None if model_filename else algo,
         )
 
     def run(self, path: PathLike) -> list[Path]:
-        """Run the venv CLI on an audio file; return the produced stem files."""
+        """Run the venv CLI on an audio file; return the produced stem files.
+
+        With ``extra_models`` set, runs audio-separator's native ensemble
+        (``-m primary --extra_models m2 … --ensemble_algorithm <algo>``).
+        """
         before = {p for p in self.work_dir.iterdir()}
         cmd = [
             str(self.cli), str(path),
@@ -388,6 +411,10 @@ class UvrEngine:
             "--output_format", "WAV",
             "--model_file_dir", self.model_file_dir,
         ]
+        if self.extra_models:
+            cmd += ["--extra_models", *self.extra_models]
+            if self.ensemble_algorithm:
+                cmd += ["--ensemble_algorithm", self.ensemble_algorithm]
         if self.use_autocast:
             cmd.append("--use_autocast")
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -416,7 +443,8 @@ def separate(
     ``device`` is accepted for backend-signature parity; audio-separator picks
     CUDA automatically inside its own venv.
     """
-    if engine is None or engine.model_filename != cfg.uvr_model:
+    primary, extra, _algo = ensemble_spec(cfg)
+    if engine is None or engine.model_filename != primary or engine.extra_models != extra:
         engine = UvrEngine.from_cfg(cfg)
 
     in_path = engine.work_dir / f"{uuid.uuid4().hex[:12]}.wav"
@@ -439,20 +467,22 @@ def separate_drums(
     audio: AudioTensor,
     cfg: Any,
     engine: UvrEngine | None = None,
+    model: str | None = None,
 ) -> tuple[dict[str, AudioTensor], str, UvrEngine]:
     """Tear a drum loop / drums stem into hit parts, in the isolated venv.
 
     ``cfg`` is a ``DrumSplitCfg`` (exposes the ``uvr_*`` fields). The drum model
-    is ``cfg.uvr_model`` when set, otherwise auto-discovered via
-    ``audio-separator --list_filter=drums``. Returns ``(parts, model, engine)``
-    with parts keyed by canonical name (kick/snare/toms/hihat/ride/crash/…).
+    is ``model`` (pinned, e.g. the ``uvr_drumsep`` backend) if given, else
+    ``cfg.uvr_model``, else auto-discovered via ``--list_filter=drums``. Returns
+    ``(parts, model, engine)`` with parts keyed by canonical name
+    (kick/snare/toms/hihat/ride/crash/…).
 
     Raises :class:`SotaEnvError` (fail-soft upstream) when ffmpeg / the venv /
     a drum model is missing; the main env is never touched.
     """
     cli = preflight(cfg)  # ffmpeg + venv, else SotaEnvError
     model_dir = _resolve_model_dir(cfg.uvr_model_dir)
-    model = cfg.uvr_model or discover_drum_model(cli, model_dir)
+    model = model or cfg.uvr_model or discover_drum_model(cli, model_dir)
     if not model:
         raise SotaEnvError(
             "no drum-separation model available in the venv — set "

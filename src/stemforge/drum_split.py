@@ -9,6 +9,13 @@ has NO per-hit drum model — its ``--list_filter=drums`` models only isolate th
 kit — so the previous ``uvr`` drum path never produced hits; it remains as an
 option but is no longer the default.
 
+Option (``backend: uvr_drumsep``): the MDX23C per-hit DrumSep model
+(``MDX23C-DrumSep-aufr33-jarredou.ckpt``, in audio-separator's registry) run
+through the isolated ``.venv-uvr`` subprocess — no torch-2.6 weights_only hack
+and no gated demucs checkpoint. Not the default only because its ``.ckpt``
+couldn't be download-verified in this build env (the CI proxy blocks GitHub
+release assets); it resolves on an open network.
+
 Fallback (``external_cmd``): any repo-based separator via a shell template::
 
     external_cmd: "python /opt/drumsep/infer.py --in {input} --out {output_dir}"
@@ -81,6 +88,15 @@ def split(
 
     if backend == "demucs_inagoy":
         return _demucs_inagoy_split(_source_audio(audio, drums_path), cfg, out_dir, device)
+
+    if backend == "uvr_drumsep":
+        # MDX23C per-hit DrumSep via the isolated .venv-uvr subprocess. Keep ALL
+        # recognized hits (kick/snare/toms/hihat/ride/crash) — the model may emit
+        # more than the inagoy 4. (The MelBand-Roformer drum model is NOT in
+        # audio-separator's registry — it needs the separate MSST framework — so
+        # it's intentionally not wired here; a future option.)
+        return _uvr_split(audio, drums_path, cfg, out_dir,
+                          model=getattr(cfg, "uvr_drumsep_model", None), keep_all=True)
 
     if backend == "uvr":
         return _uvr_split(audio, drums_path, cfg, out_dir)
@@ -260,36 +276,39 @@ def _load_demucs_checkpoint(load_model, dest: Path):
 def _uvr_split(
     audio: AudioTensor | None, drums_path: PathLike | None,
     cfg: "DrumSplitCfg", out_dir: Path,
+    model: str | None = None, keep_all: bool = False,
 ) -> dict[str, Any]:
     from . import separate_uvr as uvr
 
+    backend = "uvr_drumsep" if model else "uvr"
     if audio is None:
         if drums_path is None or not Path(drums_path).is_file():
             return {"skipped": "no drum audio (drop a drum loop or run separation first)"}
         audio = load_audio(drums_path)
 
     try:
-        parts, model, _engine = uvr.separate_drums(audio, cfg)
+        parts, used_model, _engine = uvr.separate_drums(audio, cfg, model=model)
     except uvr.SotaEnvError as e:  # missing venv / ffmpeg / drum model -> fail soft
-        return {"skipped": f"{e} — run `stemforge setup-sota`"}
+        return {"skipped": f"{e} — run `stemforge setup-sota`", "backend": backend}
     except RuntimeError as e:  # CLI crashed inside a ready env -> real error
-        return {"error": f"drum separation failed: {e}", "backend": "uvr"}
+        return {"error": f"drum separation failed: {e}", "backend": backend}
 
     if not parts:
-        return {"skipped": "drum model produced no recognizable parts", "backend": "uvr"}
+        return {"skipped": "drum model produced no recognizable parts", "backend": backend}
 
-    wanted = set(cfg.parts) if getattr(cfg, "parts", None) else None
+    # keep_all (uvr_drumsep): keep every recognized hit; otherwise honor drums.split.parts.
+    wanted = None if keep_all else (set(cfg.parts) if getattr(cfg, "parts", None) else None)
     files: dict[str, str] = {}
     for part, tensor in parts.items():
         if wanted is not None and part not in wanted:
-            continue  # honor drums.split.parts (drop residual/unrequested parts)
+            continue  # drop residual/unrequested parts
         files[part] = str(save_audio(out_dir / f"{part}.wav", tensor))
 
     if not files:  # model output didn't intersect requested parts -> keep everything
         for part, tensor in parts.items():
             files[part] = str(save_audio(out_dir / f"{part}.wav", tensor))
 
-    return {"backend": "uvr", "model": model, "parts": list(files), "files": files}
+    return {"backend": backend, "model": used_model, "parts": list(files), "files": files}
 
 
 # --------------------------------------------------------------------------- #
@@ -341,4 +360,4 @@ def _larsnet(drums_path: PathLike, out_dir: Path, cfg: "DrumSplitCfg", device: s
 
 
 def available_models() -> list[str]:
-    return ["demucs_inagoy", "uvr", "larsnet", "external"]
+    return ["demucs_inagoy", "uvr_drumsep", "uvr", "larsnet", "external"]

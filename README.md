@@ -89,7 +89,7 @@ stemforge separate song.wav --model htdemucs_ft -o out/
 stemforge separate song.wav --preset fast   # demucs htdemucs (draft)
 stemforge separate song.wav --preset best   # demucs htdemucs_ft, shifts=2
 stemforge separate song.wav --preset sota   # BS-Roformer (vocals + instrumental)
-stemforge separate song.wav --preset max    # hybrid 4-stem: roformer vocals + demucs residual
+stemforge separate song.wav --preset max    # hybrid 4-stem: vocal ensemble (uvr_max_spec) + demucs residual
 
 # Full pipeline
 stemforge run song.wav \
