@@ -34,3 +34,6 @@ out/
 
 # Isolated audio-separator venv (stemforge setup-sota)
 .venv-uvr/
+
+# Local agent instructions — untracked from the public tree (IP hygiene)
+CLAUDE.md
