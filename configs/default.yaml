@@ -28,6 +28,11 @@ separation:
   uvr_venv: .venv-uvr         # ISOLATED audio-separator venv (create via `stemforge setup-sota`);
                               # never installed into the main env — it would clobber CUDA torch/numpy
   uvr_use_autocast: true      # mixed-precision inference on CUDA (passed to the CLI)
+  # Multi-model ensemble via audio-separator's native ensembler (in the venv subprocess).
+  # The `max` preset enables the verified vocal ensemble; set your own list to customize.
+  ensemble_enabled: false
+  ensemble_models: []         # e.g. [bs_roformer_vocals_resurrection_unwa.ckpt, melband_roformer_big_beta6x.ckpt]
+  uvr_ensemble_algorithm: uvr_max_spec  # avg_wave | median_wave | max_fft | uvr_max_spec | …
   stems: [vocals, drums, bass, other]   # 6s adds: guitar, piano; uvr 2-stem: vocals, instrumental
   segment: 10           # seconds; lower => less VRAM
   overlap: 0.25
@@ -61,7 +66,7 @@ midi:
 drums:
   split:
     enabled: false
-    backend: demucs_inagoy    # demucs_inagoy (main-env Demucs, default) | uvr | larsnet | external
+    backend: demucs_inagoy    # demucs_inagoy (default) | uvr_drumsep (MDX23C via .venv-uvr) | uvr | larsnet | external
     model: drumsep_roformer   # legacy label for the larsnet/external paths
     parts: [kick, snare, toms, other]   # inagoy/drumsep emits these 4
     from_input: false         # true = tear down the raw input loop (skip needing a drums stem)
@@ -69,7 +74,10 @@ drums:
     # Public, non-gated MIT mirror (the old mnstrmnl/drumsep URL now returns 401).
     inagoy_url: https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th
     inagoy_model_dir: models/drumsep
-    # uvr drum path (isolated venv) — audio-separator has no per-hit model, kept as an option
+    # uvr_drumsep: MDX23C per-hit DrumSep via the isolated .venv-uvr (an option, not the
+    # default — its .ckpt is registry-listed but couldn't be download-verified in-env).
+    uvr_drumsep_model: MDX23C-DrumSep-aufr33-jarredou.ckpt
+    # `uvr` drum path (isolated venv) — auto-discovers a kit-isolation model, not per-hit
     uvr_model: null
     uvr_model_dir: models/uvr
     uvr_venv: .venv-uvr

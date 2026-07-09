@@ -152,6 +152,39 @@ def test_explicit_uvr_model_skips_discovery(fake_drum_cli, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# uvr_drumsep backend — MDX23C per-hit DrumSep via the venv subprocess (option)
+# --------------------------------------------------------------------------- #
+def _uvr_drumsep_cfg(**over):
+    cfg = load_config().drums.split
+    cfg.enabled = True
+    cfg.backend = "uvr_drumsep"
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def test_uvr_drumsep_pins_mdx23c_and_maps_all_hits(fake_drum_cli, tmp_path):
+    cfg = _uvr_drumsep_cfg()
+    res = drum_split.split(None, cfg, tmp_path, audio=_click_loop())
+
+    assert res["backend"] == "uvr_drumsep"
+    assert res["model"] == "MDX23C-DrumSep-aufr33-jarredou.ckpt"  # pinned
+    assert fake_drum_cli["list"] == 0  # pinned model -> no --list_filter discovery
+    # keep_all: every recognized hit is kept even though cfg.parts defaults to 4
+    assert set(res["files"]) == {"kick", "snare", "toms", "hihat", "ride", "crash"}
+    for p in res["files"].values():
+        assert Path(p).is_file()
+
+
+def test_uvr_drumsep_fails_soft_without_venv(monkeypatch, tmp_path):
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(separate_uvr, "find_cli", lambda venv_dir: None)  # venv not set up
+    res = drum_split.split(None, _uvr_drumsep_cfg(), tmp_path, audio=_click_loop())
+    assert "skipped" in res and res["backend"] == "uvr_drumsep"
+    assert "setup-sota" in res["skipped"]
+
+
+# --------------------------------------------------------------------------- #
 # Fail-soft (isolation preserved)
 # --------------------------------------------------------------------------- #
 def test_missing_venv_fails_soft(monkeypatch, tmp_path):

@@ -131,6 +131,41 @@ def _base_overrides(tmp_path) -> dict:
     }
 
 
+def test_max_preset_wires_verified_vocal_ensemble():
+    from stemforge.orchestrator import ENSEMBLE_VOCALS
+
+    sep = load_config(overrides={"separation.preset": "max"}).separation
+    assert sep.ensemble_enabled is True
+    assert sep.ensemble_models == ENSEMBLE_VOCALS
+    assert sep.uvr_ensemble_algorithm == "uvr_max_spec"
+
+
+def test_ensemble_cli_invocation(fake_uvr_cli, sine):
+    """Max's ensemble runs `-m primary --extra_models m2 --ensemble_algorithm uvr_max_spec`."""
+    from stemforge.orchestrator import ENSEMBLE_VOCALS
+
+    audio = AudioTensor(*sine)
+    cfg = load_config(overrides={"separation.preset": "max"}).separation
+    # route through the uvr stage directly (hybrid would then run demucs on the residual)
+    stems, engine = separate_uvr.separate(audio, cfg, device="cpu")
+    assert set(stems) == {"vocals", "instrumental"}
+
+    cmd = fake_uvr_cli["cmds"][0]
+    assert cmd[cmd.index("--model_filename") + 1] == ENSEMBLE_VOCALS[0]  # primary
+    assert "--extra_models" in cmd
+    extra_i = cmd.index("--extra_models")
+    assert cmd[extra_i + 1] == ENSEMBLE_VOCALS[1]                        # the extra model
+    assert cmd[cmd.index("--ensemble_algorithm") + 1] == "uvr_max_spec"
+    assert engine.extra_models == ENSEMBLE_VOCALS[1:]
+
+
+def test_non_ensemble_uvr_has_no_extra_models(fake_uvr_cli, sine):
+    cfg = load_config(overrides={"separation.preset": "sota"}).separation
+    separate_uvr.separate(AudioTensor(*sine), cfg, device="cpu")
+    cmd = fake_uvr_cli["cmds"][0]
+    assert "--extra_models" not in cmd and "--ensemble_algorithm" not in cmd
+
+
 def test_separate_uvr_maps_and_caches(fake_uvr_cli, sine):
     samples, sr = sine
     audio = AudioTensor(samples, sr)
@@ -206,7 +241,10 @@ def test_pipeline_hybrid_backend(fake_uvr_cli, monkeypatch, tmp_path, sine_wav):
     assert seen["stems_requested"] == ["drums", "bass", "other"]
     assert set(m["models"]) == {"uvr", "demucs"}
     assert m["models"]["demucs"] == "htdemucs_ft"
-    assert "model_bs_roformer" in sep["model"] and "htdemucs_ft" in sep["model"]
+    # Max now runs the verified vocal ensemble (uvr_max_spec) + demucs residual.
+    assert "bs_roformer_vocals_resurrection_unwa" in sep["model"]
+    assert "melband_roformer_big_beta6x" in sep["model"]
+    assert "htdemucs_ft" in sep["model"]
 
 
 def test_hybrid_keeps_uvr_result_when_demucs_missing(fake_uvr_cli, monkeypatch, tmp_path, sine_wav):
@@ -224,6 +262,28 @@ def test_hybrid_keeps_uvr_result_when_demucs_missing(fake_uvr_cli, monkeypatch, 
     assert sep["backend"] == "hybrid"
     assert set(sep["files"]) == {"vocals.wav", "instrumental.wav"}  # degraded 2-stem
     assert any("demucs" in n for n in sep["notes"])
+
+
+def test_max_degrades_to_demucs_when_uvr_unavailable(monkeypatch, tmp_path, sine_wav):
+    """Max never regresses to an error: no venv -> full demucs 4-stem + a note."""
+    import stemforge.separate as demucs_mod
+
+    monkeypatch.setattr(separate_uvr, "have_ffmpeg", lambda: True)
+    monkeypatch.setattr(separate_uvr, "find_cli", lambda venv_dir: None)  # venv not set up
+
+    def fake_demucs(audio, cfg, device="cpu", model=None):
+        mk = lambda: AudioTensor(np.zeros((2, audio.num_samples), np.float32), audio.sample_rate)
+        return {"vocals": mk(), "drums": mk(), "bass": mk(), "other": mk()}, "demucs-bag"
+
+    monkeypatch.setattr(demucs_mod, "separate", fake_demucs)
+    cfg = load_config(overrides={**_base_overrides(tmp_path), "separation.preset": "max"})
+    m = Pipeline(cfg).run(sine_wav)
+
+    sep = m["separation"]
+    assert "error" not in sep and "skipped" not in sep
+    assert set(sep["files"]) == {"vocals.wav", "drums.wav", "bass.wav", "other.wav"}
+    assert set(m["models"]) == {"demucs"}                      # UVR label dropped
+    assert any("fell back to demucs" in n for n in sep.get("notes", []))
 
 
 # --------------------------------------------------------------------------- #

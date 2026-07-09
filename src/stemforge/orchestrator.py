@@ -51,6 +51,19 @@ class AnalysisCfg:
 BS_ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 
 
+# Verified multi-model ensemble sets from audio-separator's own
+# ensemble_presets.json (all four filenames are keys in its models.json registry).
+# Run via the CLI's native ensemble (`-m primary --extra_models ... --ensemble_algorithm`).
+ENSEMBLE_VOCALS = [  # preset 'vocal_balanced'
+    "bs_roformer_vocals_resurrection_unwa.ckpt",
+    "melband_roformer_big_beta6x.ckpt",
+]
+ENSEMBLE_INSTRUMENTAL = [  # preset 'instrumental_full' — inst SDR ~17.55
+    "melband_roformer_inst_v1e_plus.ckpt",
+    "mel_band_roformer_instrumental_becruily.ckpt",
+]
+
+
 @dataclass
 class SeparationCfg:
     enabled: bool = True
@@ -61,6 +74,10 @@ class SeparationCfg:
     uvr_model_dir: str = "models/uvr"
     uvr_venv: str = ".venv-uvr"  # isolated audio-separator venv (see `stemforge setup-sota`)
     uvr_use_autocast: bool = True
+    # Multi-model ensemble (audio-separator's native ensemble, in the venv subprocess).
+    ensemble_enabled: bool = False
+    ensemble_models: list[str] = field(default_factory=list)
+    uvr_ensemble_algorithm: str = "uvr_max_spec"  # max-spec merge
     stems: list[str] = field(default_factory=lambda: ["vocals", "drums", "bass", "other"])
     segment: float = 10.0
     overlap: float = 0.25
@@ -83,11 +100,16 @@ SEPARATION_PRESETS: dict[str, dict[str, Any]] = {
         "uvr_model": BS_ROFORMER_MODEL,
         "stems": ["vocals", "instrumental"],
     },
-    # Max 4-stem: BS-Roformer vocals + htdemucs_ft on the instrumental residual
+    # Max 4-stem: a real multi-model vocal ensemble (uvr_max_spec) for the
+    # vocals/instrumental split + htdemucs_ft on the instrumental residual.
+    # Falls back to demucs 4-stem if the venv/ensemble isn't available.
     "max": {
         "backend": "hybrid",
         "model": "htdemucs_ft",
-        "uvr_model": BS_ROFORMER_MODEL,
+        "uvr_model": BS_ROFORMER_MODEL,          # single-model fallback primary
+        "ensemble_enabled": True,
+        "ensemble_models": list(ENSEMBLE_VOCALS),
+        "uvr_ensemble_algorithm": "uvr_max_spec",
         "shifts": 2,
         "stems": ["vocals", "drums", "bass", "other"],
     },
@@ -139,7 +161,9 @@ class MidiCfg:
 @dataclass
 class DrumSplitCfg:
     enabled: bool = False
-    backend: str = "demucs_inagoy"  # demucs_inagoy (main-env Demucs) | uvr | larsnet | external
+    # demucs_inagoy (main-env Demucs, default) | uvr_drumsep (MDX23C via .venv-uvr)
+    # | uvr (audio-separator kit-isolation, discovery) | larsnet | external
+    backend: str = "demucs_inagoy"
     model: str = "drumsep_roformer"  # legacy label for the larsnet/external paths
     parts: list[str] = field(default_factory=lambda: ["kick", "snare", "toms", "other"])
     from_input: bool = False  # tear down the raw input loop instead of the separated drums stem
@@ -148,7 +172,10 @@ class DrumSplitCfg:
     # mnstrmnl/drumsep URL is now gated and returns HTTP 401.
     inagoy_url: str = "https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th"
     inagoy_model_dir: str = "models/drumsep"
-    # uvr drum path (isolated venv) — kept as an option; audio-separator has no per-hit model.
+    # uvr_drumsep: MDX23C per-hit DrumSep via the isolated .venv-uvr (registry-listed;
+    # not the default because its .ckpt couldn't be download-verified in-env).
+    uvr_drumsep_model: str = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
+    # `uvr` path (isolated venv) — auto-discovers a kit-isolation model, not per-hit.
     uvr_model: str | None = None
     uvr_model_dir: str = "models/uvr"
     uvr_venv: str = ".venv-uvr"
@@ -477,19 +504,33 @@ class Pipeline:
     ) -> dict[str, AudioTensor]:
         from . import separate_uvr
 
-        cache_key = f"uvr:{cfg.uvr_model}"
+        primary, extra, _algo = separate_uvr.ensemble_spec(cfg)
+        label = " + ".join([primary, *extra])
+        cache_key = f"uvr:{label}"
         stems, engine = separate_uvr.separate(
             ctx.audio, cfg, device=ctx.device, engine=self._model_cache.get(cache_key),
         )
         self._model_cache[cache_key] = engine
-        models_used["uvr"] = cfg.uvr_model
+        models_used["uvr"] = label
         return stems
 
     def _separate_hybrid(
         self, ctx: RunContext, cfg: SeparationCfg, models_used: dict[str, str], notes: list[str],
     ) -> dict[str, AudioTensor]:
-        """BS-Roformer vocals + demucs on the instrumental residual, merged 4-stem."""
-        uvr_stems = self._separate_uvr(ctx, cfg, models_used)
+        """UVR (single or ensemble) vocals + demucs on the instrumental residual.
+
+        If the UVR stage is unavailable (venv not set up, or a gated/failed model
+        download), Max degrades to a full demucs 4-stem so it never regresses to
+        an error — the demucs default is the safety net.
+        """
+        from .separate_uvr import SotaEnvError
+
+        try:
+            uvr_stems = self._separate_uvr(ctx, cfg, models_used)
+        except (SotaEnvError, RuntimeError) as e:
+            notes.append(f"uvr ensemble unavailable ({e}); fell back to demucs {cfg.model}")
+            models_used.pop("uvr", None)
+            return self._separate_demucs(ctx, cfg, models_used)
         instrumental = uvr_stems.get("instrumental")
         if instrumental is None:  # 4-stem UVR model: nothing left to refine
             notes.append("uvr model produced no instrumental stem; demucs refinement skipped")
