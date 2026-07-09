@@ -77,6 +77,14 @@ Manual, dropped into `models/` (see `models/README.md`):
 
 `beat_this` weights download automatically on first inference.
 
+> **Security — pinned drum checkpoint.** The auto-downloaded `inagoy/drumsep`
+> checkpoint is loaded via `torch.load(weights_only=False)` (a full pickle), so a
+> swapped file could run arbitrary code. StemForge refuses to install or load it
+> unless its **sha256 matches `drums.split.inagoy_sha256`** (default pinned in
+> `configs/default.yaml`) — no verified hash, no load, no fallback. If you point
+> `inagoy_url` at your own checkpoint, set a matching `inagoy_sha256` too, or the
+> load is refused.
+
 ---
 
 ## Quickstart

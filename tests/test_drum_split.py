@@ -348,22 +348,30 @@ def test_inagoy_missing_demucs_fails_soft(monkeypatch, tmp_path):
 
 
 def test_inagoy_checkpoint_download_and_cache(monkeypatch, tmp_path):
-    """Downloads once into inagoy_model_dir; reuses the cached file next time."""
+    """Downloads once into inagoy_model_dir; reuses the cached file next time.
+
+    Post-C1: a custom URL needs a matching sha256 pin, so we pin the fake blob's
+    real hash — the download then verifies and installs, and the cache is reused.
+    """
+    import hashlib
+    import urllib.request
+
+    blob = b"fake-checkpoint"
     calls = {"n": 0}
 
     def fake_urlretrieve(url, dest):
         calls["n"] += 1
-        Path(dest).write_bytes(b"fake-checkpoint")
+        Path(dest).write_bytes(blob)
 
-    import urllib.request
     monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
     cfg = _inagoy_cfg(inagoy_model_dir=str(tmp_path / "dr"),
-                      inagoy_url="http://example.test/drumsep.th")
+                      inagoy_url="http://example.test/drumsep.th",
+                      inagoy_sha256=hashlib.sha256(blob).hexdigest())
 
     p1 = drum_split._ensure_inagoy_checkpoint(cfg)
     p2 = drum_split._ensure_inagoy_checkpoint(cfg)
     assert p1 == p2 and p1.is_file() and p1.name == "drumsep.th"
-    assert calls["n"] == 1  # second call hits the cache
+    assert calls["n"] == 1  # second call hits the (verified) cache
 
 
 def test_default_inagoy_url_is_public_mirror_and_caches_modelo_final(tmp_path):
@@ -374,9 +382,13 @@ def test_default_inagoy_url_is_public_mirror_and_caches_modelo_final(tmp_path):
     assert cfg.inagoy_model_dir == "models/drumsep"
     assert drum_split._inagoy_filename(cfg.inagoy_url) == "modelo_final.th"
 
+    import hashlib
+
     cfg.inagoy_model_dir = str(tmp_path / "dr")
     (tmp_path / "dr").mkdir()
     (tmp_path / "dr" / "modelo_final.th").write_bytes(b"x")  # pretend already cached
+    # default URL kept -> pin the cached blob's real hash so verification passes
+    cfg.inagoy_sha256 = hashlib.sha256(b"x").hexdigest()
     assert drum_split._ensure_inagoy_checkpoint(cfg) == tmp_path / "dr" / "modelo_final.th"
 
 
@@ -458,3 +470,102 @@ def test_pipeline_drum_loop_inagoy_to_stems_and_midi(fake_inagoy, tmp_path):
     assert dm["source"] == "parts"
     assert dm["note_count"] > 0
     assert (tmp_path / "out" / "break" / "drums" / "drums.mid").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# inagoy checkpoint sha256 pin — audit finding C1 (RCE fix). GPU-free, no network.
+# --------------------------------------------------------------------------- #
+def _sha(b: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+
+def test_drumsep_download_hash_mismatch_fails_closed(monkeypatch, tmp_path):
+    """A tampered download is refused: raises, tmp removed, nothing installed,
+    the demucs/torch loader is never invoked."""
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlretrieve",
+                        lambda url, dest: Path(dest).write_bytes(b"tampered-not-real"))
+
+    loaded = {"n": 0}
+    monkeypatch.setattr(drum_split, "_load_demucs_checkpoint",
+                        lambda *a, **k: loaded.__setitem__("n", loaded["n"] + 1))
+
+    # default URL + built-in default pin -> tampered bytes cannot match it
+    cfg = _inagoy_cfg(inagoy_model_dir=str(tmp_path / "dr"))
+
+    # direct: _ensure raises the integrity error AND cleans up the tmp file
+    with pytest.raises(drum_split._DrumCheckpointIntegrityError) as ei:
+        drum_split._ensure_inagoy_checkpoint(cfg)
+    assert "integrity" in str(ei.value).lower()
+    assert list((tmp_path / "dr").glob("*")) == []  # no .part, nothing installed
+
+    # end-to-end: split() surfaces a loud ERROR and never reaches the loader
+    res = drum_split.split(None, cfg, tmp_path / "out", audio=_click_loop())
+    assert "error" in res and "integrity" in res["error"].lower()
+    assert loaded["n"] == 0  # torch.load / demucs loader never invoked
+
+
+def test_drumsep_local_hash_mismatch_refuses_load(monkeypatch, tmp_path):
+    """A pre-existing local checkpoint with the wrong hash is refused before load."""
+    model_dir = tmp_path / "dr"
+    model_dir.mkdir()
+    (model_dir / "modelo_final.th").write_bytes(b"stale-or-tampered")
+
+    loaded = {"n": 0}
+    monkeypatch.setattr(drum_split, "_load_demucs_checkpoint",
+                        lambda *a, **k: loaded.__setitem__("n", loaded["n"] + 1))
+
+    cfg = _inagoy_cfg(inagoy_model_dir=str(model_dir))  # default URL + default pin
+    res = drum_split.split(None, cfg, tmp_path / "out", audio=_click_loop())
+    assert "error" in res and "integrity" in res["error"].lower()
+    assert "delete" in res["error"].lower()  # remediation text present
+    assert loaded["n"] == 0
+
+
+def test_drumsep_hash_match_loads(monkeypatch, tmp_path):
+    """A checkpoint whose sha256 matches the pin proceeds through the full verified
+    path to the (mocked) demucs load."""
+    import sys
+    import types
+
+    content = b"a-trusted-checkpoint-blob"
+    model_dir = tmp_path / "dr"
+    model_dir.mkdir()
+    (model_dir / "modelo_final.th").write_bytes(content)
+
+    # pin the local file's real hash (default URL kept)
+    cfg = _inagoy_cfg(inagoy_model_dir=str(model_dir), inagoy_sha256=_sha(content))
+
+    # satisfy the lazy `from demucs.states import load_model` with a fake that
+    # returns a demucs-shaped model; the real _load_demucs_checkpoint runs on top.
+    fake_demucs = types.ModuleType("demucs")
+    fake_states = types.ModuleType("demucs.states")
+    fake_states.load_model = lambda p: _FakeDemucs()
+    monkeypatch.setitem(sys.modules, "demucs", fake_demucs)
+    monkeypatch.setitem(sys.modules, "demucs.states", fake_states)
+
+    import stemforge.separate as sep
+    monkeypatch.setattr(sep, "apply_model_to_audio",
+                        lambda model, audio, device="cuda", **kw: {n: audio for n in model.sources})
+
+    res = drum_split.split(None, cfg, tmp_path / "out", audio=_click_loop())
+    assert res["backend"] == "demucs_inagoy"
+    assert set(res["files"]) == {"kick", "snare", "toms", "other"}
+
+
+def test_drumsep_url_override_without_hash_refuses(monkeypatch, tmp_path):
+    """Overriding inagoy_url while leaving the default pin is refused pre-download."""
+    import urllib.request
+
+    called = {"n": 0}
+    monkeypatch.setattr(urllib.request, "urlretrieve",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+
+    cfg = _inagoy_cfg(inagoy_model_dir=str(tmp_path / "dr"),
+                      inagoy_url="http://evil.test/x.th",
+                      inagoy_sha256=drum_split.INAGOY_DEFAULT_SHA256)  # not a real override
+    res = drum_split.split(None, cfg, tmp_path / "out", audio=_click_loop())
+    assert "error" in res and "inagoy_sha256" in res["error"]
+    assert called["n"] == 0  # never even attempted a download

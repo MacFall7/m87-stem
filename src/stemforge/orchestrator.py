@@ -172,6 +172,11 @@ class DrumSplitCfg:
     # mnstrmnl/drumsep URL is now gated and returns HTTP 401.
     inagoy_url: str = "https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th"
     inagoy_model_dir: str = "models/drumsep"
+    # sha256 integrity pin for the inagoy checkpoint (audit finding C1). Empty =>
+    # the built-in default pin (drum_split.INAGOY_DEFAULT_SHA256) is honored *only*
+    # for the default URL; a custom inagoy_url without a matching inagoy_sha256 is
+    # refused at load time (fail-closed). See drum_split._expected_inagoy_sha256.
+    inagoy_sha256: str = ""
     # uvr_drumsep: MDX23C per-hit DrumSep via the isolated .venv-uvr (registry-listed;
     # not the default because its .ckpt couldn't be download-verified in-env).
     uvr_drumsep_model: str = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
