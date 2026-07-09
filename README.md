@@ -115,12 +115,12 @@ stemforge ui
 ### Launch the app
 
 ```bash
-stemforge ui                 # start the M87 workstation and open the browser
+stemforge ui                 # start the StemForge workstation and open the browser
 stemforge ui --no-open       # start it without opening a browser
 stemforge desktop-shortcut   # create a double-clickable Desktop launcher
 ```
 
-The web UI is the **M87 workstation** — a bespoke local web app (a FastAPI
+The web UI is the **StemForge workstation** — a bespoke local web app (a FastAPI
 backend + a custom single-page front-end served by uvicorn; no Gradio). A dark,
 deep-space console with a left workflow rail and four panels, no page reloads:
 
@@ -132,7 +132,7 @@ deep-space console with a left workflow rail and four panels, no page reloads:
 
 Every input and result gets a wavesurfer.js waveform with play/solo/download; a
 BPM chip, download-all, and open-folder are one click. All theme colors/fonts are
-CSS variables at the top of `web/assets/styles.css` — swap in exact M87 tokens
+CSS variables at the top of `web/assets/styles.css` — swap in your exact brand tokens
 without touching the rest of the stylesheet.
 
 `stemforge desktop-shortcut` drops a native launcher on your Desktop — a `.lnk`
@@ -165,7 +165,7 @@ out/<song>/
 | 3 | melodic MIDI (Basic Pitch ONNX) | 🟡 interface complete; drop in `basic_pitch.onnx` |
 | 4 | drum teardown (inagoy/drumsep Demucs, main env) | ✅ working — loop/stem → hit stems |
 | 5 | drum MIDI (parts-based, GM + velocity) | ✅ working — loop → GM `.mid` (ADTOF path optional) |
-| 6 | orchestrator + M87 workstation UI | ✅ working |
+| 6 | orchestrator + StemForge workstation UI | ✅ working |
 | 7 | hardening / golden-file tests | 🟡 in progress |
 
 ✅ = runs today · 🟡 = interface + logic in place, needs the external model weight/repo wired
@@ -185,7 +185,7 @@ stemforge/
 │  ├─ ingest.py  analysis.py  separate.py  separate_uvr.py  midi_melodic.py
 │  ├─ drum_split.py  drum_midi.py  stretch.py  desktop.py
 │  ├─ orchestrator.py  io_utils.py  cli.py
-│  ├─ webapp.py               # FastAPI backend (the M87 workstation)
+│  ├─ webapp.py               # FastAPI backend (the StemForge workstation)
 │  └─ web/                    # static SPA: index.html + assets/{styles.css,app.js}
 └─ tests/
 ```

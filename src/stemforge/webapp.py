@@ -1,4 +1,4 @@
-"""§5.9 webapp — the M87 workstation as a bespoke FastAPI app (no Gradio).
+"""§5.9 webapp — the StemForge workstation as a bespoke FastAPI app (no Gradio).
 
 A tiny FastAPI backend runs the existing :class:`~stemforge.orchestrator.Pipeline`
 and serves a static single-page front-end (``web/``). Four workflow endpoints
@@ -224,7 +224,7 @@ def create_app():
     from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 
-    app = FastAPI(title="M87 · StemForge", docs_url=None, redoc_url=None)
+    app = FastAPI(title="StemForge", docs_url=None, redoc_url=None)
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     if (WEB_DIR / "assets").is_dir():
