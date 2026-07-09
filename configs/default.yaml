@@ -74,6 +74,10 @@ drums:
     # Public, non-gated MIT mirror (the old mnstrmnl/drumsep URL now returns 401).
     inagoy_url: https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th
     inagoy_model_dir: models/drumsep
+    # sha256 integrity pin (audit C1): the downloaded/cached checkpoint MUST match
+    # this or it is refused (no unsafe torch.load without a verified hash). Override
+    # inagoy_url only together with a matching inagoy_sha256 (else load is refused).
+    inagoy_sha256: aefaa8543c9b9c75e22f5f32b53ab86dfe416457849af1383ff1aef83401423f
     # uvr_drumsep: MDX23C per-hit DrumSep via the isolated .venv-uvr (an option, not the
     # default — its .ckpt is registry-listed but couldn't be download-verified in-env).
     uvr_drumsep_model: MDX23C-DrumSep-aufr33-jarredou.ckpt

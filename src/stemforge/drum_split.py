@@ -32,7 +32,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .io_utils import AudioTensor, PathLike, ensure_dir, load_audio, save_audio
+from .io_utils import AudioTensor, PathLike, ensure_dir, load_audio, save_audio, sha256_file
 
 try:  # pragma: no cover
     from .orchestrator import DrumSplitCfg
@@ -41,6 +41,24 @@ except Exception:  # pragma: no cover
 
 # Anchor for a relative model dir, so the checkpoint cache is shared, not per-cwd.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# --------------------------------------------------------------------------- #
+# Hash pin for the inagoy/drumsep checkpoint — audit finding C1 (RCE fix).
+# --------------------------------------------------------------------------- #
+# The default drum checkpoint auto-downloads from a community mirror and is loaded
+# with torch.load(weights_only=False) (a full pickle unpickle). A swapped/tampered
+# artifact would therefore execute arbitrary code. We refuse to install OR load the
+# checkpoint unless its sha256 matches this pin — no verified hash, no unsafe load.
+#
+# Provenance (contract EC-SF-C1-20260709, Mac-gated 2026-07-09): the pin is a
+# single-mirror TOFU value for `Eddycrack864/Drumsep` `modelo_final.th`
+# (size 167400043 bytes). The canonical `inagoy/drumsep` repo is gated and exposes
+# no public hash, so no independent second source exists to cross-check against;
+# the mirror's LFS sha256 was confirmed by two independent observers on the public
+# HuggingFace blob page, and HF's pickle scan lists only benign globals
+# (HDemucs, _rebuild_tensor_v2, OrderedDict, HalfStorage). The literal value lives
+# ONLY here and in configs/default.yaml (see AC2); do not duplicate it.
+INAGOY_DEFAULT_SHA256 = "aefaa8543c9b9c75e22f5f32b53ab86dfe416457849af1383ff1aef83401423f"
 
 # Canonical parts and the filename keywords we use to map arbitrary outputs to them.
 _PART_KEYWORDS = {
@@ -126,6 +144,39 @@ class _DrumModelUnavailable(RuntimeError):
     """The inagoy checkpoint can't be fetched/loaded — fail soft (skip)."""
 
 
+class _DrumCheckpointIntegrityError(RuntimeError):
+    """A checkpoint failed its sha256 pin, or a custom URL was set without a
+    matching pin (audit C1). Surfaced as a manifest ``error`` (loud), never a
+    silent ``skipped`` — a hash mismatch is a security event, not a missing model."""
+
+
+def _expected_inagoy_sha256(cfg: "DrumSplitCfg") -> str:
+    """Resolve the sha256 the checkpoint must match, enforcing the fail-closed pin.
+
+    - an explicit ``cfg.inagoy_sha256`` wins (the user pinned their own checkpoint);
+    - an empty pin is honored **only** for the default mirror URL → the built-in
+      ``INAGOY_DEFAULT_SHA256``;
+    - a custom ``inagoy_url`` left with the default (or empty) pin → refuse (S5):
+      we will not download/load an unverified checkpoint from an unrecognized URL.
+    """
+    pinned = (getattr(cfg, "inagoy_sha256", "") or "").strip().lower()
+    fields = getattr(type(cfg), "__dataclass_fields__", {})
+    default_url = fields["inagoy_url"].default if "inagoy_url" in fields else None
+    url_is_default = default_url is not None and cfg.inagoy_url == default_url
+
+    if url_is_default:
+        return pinned or INAGOY_DEFAULT_SHA256
+    # custom URL: require an explicit, non-default pin to accompany it
+    if pinned and pinned != INAGOY_DEFAULT_SHA256:
+        return pinned
+    raise _DrumCheckpointIntegrityError(
+        "drums.split.inagoy_url was overridden without a matching "
+        "drums.split.inagoy_sha256 pin — refusing to fetch/load an unverified "
+        "checkpoint. Set drums.split.inagoy_sha256 to the expected sha256 of the "
+        "file at that URL."
+    )
+
+
 def _source_audio(audio: AudioTensor | None, drums_path: PathLike | None) -> AudioTensor | None:
     if audio is not None:
         return audio
@@ -145,6 +196,9 @@ def _demucs_inagoy_split(
 
     try:
         model, model_name = _load_inagoy_model(cfg, device)
+    except _DrumCheckpointIntegrityError as e:  # security: hash mismatch / pin-less URL
+        return {"error": f"inagoy checkpoint integrity check failed: {e}",
+                "backend": "demucs_inagoy"}
     except _DrumModelUnavailable as e:
         return {"skipped": f"{e}", "backend": "demucs_inagoy"}
     except ModuleNotFoundError as e:  # demucs / torch not installed
@@ -198,13 +252,29 @@ def _inagoy_filename(url: str) -> str:
 
 
 def _ensure_inagoy_checkpoint(cfg: "DrumSplitCfg") -> Path:
+    """Return a **hash-verified** checkpoint path (audit C1). Every path — cached
+    file or fresh download — is gated on the sha256 pin before it is returned, so
+    the caller's ``torch.load(weights_only=False)`` only ever sees a verified file.
+    """
+    expected = _expected_inagoy_sha256(cfg)  # raises (S5) on a pin-less custom URL
     model_dir = Path(cfg.inagoy_model_dir).expanduser()
     if not model_dir.is_absolute():
         model_dir = _PROJECT_ROOT / model_dir
     ensure_dir(model_dir)
     dest = model_dir / _inagoy_filename(cfg.inagoy_url or "")
+
+    # S3: a pre-existing local checkpoint is hash-verified before EVERY load.
     if dest.is_file():
+        actual = sha256_file(dest).lower()
+        if actual != expected:
+            raise _DrumCheckpointIntegrityError(
+                f"cached inagoy drumsep checkpoint {dest.name} failed its sha256 "
+                f"integrity check (expected {expected}, got {actual}); refusing to "
+                f"load a possibly-tampered file — delete {dest} and re-download, or "
+                f"set drums.split.inagoy_sha256 to the correct pin"
+            )
         return dest
+
     if not cfg.inagoy_url:
         raise _DrumModelUnavailable(
             "no inagoy drumsep URL — set drums.split.inagoy_url to the checkpoint"
@@ -214,13 +284,25 @@ def _ensure_inagoy_checkpoint(cfg: "DrumSplitCfg") -> Path:
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         urllib.request.urlretrieve(cfg.inagoy_url, tmp)  # noqa: S310 - user-configured URL
-        tmp.replace(dest)
     except Exception as e:  # noqa: BLE001 - any network/FS failure -> fail soft
         tmp.unlink(missing_ok=True)
         raise _DrumModelUnavailable(
             f"could not download inagoy drumsep model ({e}); set drums.split.inagoy_url "
             f"or drop the checkpoint into {model_dir}"
         ) from e
+
+    # S2: verify the download BEFORE it is installed — mismatch => delete, no move,
+    # no fallback, no load.
+    actual = sha256_file(tmp).lower()
+    if actual != expected:
+        tmp.unlink(missing_ok=True)
+        raise _DrumCheckpointIntegrityError(
+            f"downloaded inagoy drumsep checkpoint failed its sha256 integrity check "
+            f"(expected {expected}, got {actual}); the file was NOT installed and NOT "
+            f"loaded — no fallback (possible mirror tamper or a wrong "
+            f"drums.split.inagoy_sha256 pin)"
+        )
+    tmp.replace(dest)  # atomic install only after verification
     return dest
 
 
