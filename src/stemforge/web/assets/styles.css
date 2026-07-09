@@ -25,6 +25,9 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` must always win — author display rules (e.g. `.ctrl{display:flex}`)
+   otherwise outrank the UA `[hidden]{display:none}` and leak controls. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;

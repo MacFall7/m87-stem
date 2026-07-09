@@ -333,6 +333,75 @@ def test_inagoy_checkpoint_download_and_cache(monkeypatch, tmp_path):
     assert calls["n"] == 1  # second call hits the cache
 
 
+def test_default_inagoy_url_is_public_mirror_and_caches_modelo_final(tmp_path):
+    """The default points at the public Eddycrack864 mirror; cache basename is
+    modelo_final.th under models/drumsep/."""
+    cfg = load_config().drums.split
+    assert cfg.inagoy_url == "https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th"
+    assert cfg.inagoy_model_dir == "models/drumsep"
+    assert drum_split._inagoy_filename(cfg.inagoy_url) == "modelo_final.th"
+
+    cfg.inagoy_model_dir = str(tmp_path / "dr")
+    (tmp_path / "dr").mkdir()
+    (tmp_path / "dr" / "modelo_final.th").write_bytes(b"x")  # pretend already cached
+    assert drum_split._ensure_inagoy_checkpoint(cfg) == tmp_path / "dr" / "modelo_final.th"
+
+
+def test_inagoy_loader_torch26_weights_only_fallback(monkeypatch, tmp_path):
+    """torch>=2.6 rejects the pickled HDemucs global under weights_only=True;
+    the loader retries with weights_only=False and succeeds."""
+    import sys
+    import types
+
+    dest = tmp_path / "modelo_final.th"
+    dest.write_bytes(b"ckpt")
+    monkeypatch.setattr(drum_split, "_ensure_inagoy_checkpoint", lambda cfg: dest)
+
+    weights_only_seen: list = []
+
+    class FakeModel:
+        def to(self, _d):
+            return self
+
+        def eval(self):
+            return self
+
+    # A fake `torch` whose load mimics torch 2.6: weights_only defaults True and
+    # rejects the demucs global; passing weights_only=False succeeds.
+    fake_torch = types.ModuleType("torch")
+
+    def fake_load(path, *args, weights_only=True, **kwargs):
+        weights_only_seen.append(weights_only)
+        if weights_only:
+            raise Exception(  # noqa: TRY002 - mirrors torch's UnpicklingError text
+                "Unsupported global: GLOBAL demucs.hdemucs.HDemucs was not an "
+                "allowed global by default"
+            )
+        return FakeModel()
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    # A fake demucs.states.load_model that routes through torch.load, like the real one.
+    fake_demucs = types.ModuleType("demucs")
+    fake_states = types.ModuleType("demucs.states")
+
+    def load_model(p):
+        import torch
+
+        return torch.load(p)  # no weights_only kwarg -> default path / our patch
+
+    fake_states.load_model = load_model
+    monkeypatch.setitem(sys.modules, "demucs", fake_demucs)
+    monkeypatch.setitem(sys.modules, "demucs.states", fake_states)
+
+    model, name = drum_split._load_inagoy_model(_inagoy_cfg(), "cpu")
+    assert isinstance(model, FakeModel)
+    assert name == "modelo_final.th"
+    assert weights_only_seen == [True, False]  # rejected first, retried without
+    assert fake_torch.load is fake_load        # torch.load restored after the retry
+
+
 def test_pipeline_drum_loop_inagoy_to_stems_and_midi(fake_inagoy, tmp_path):
     loop = _click_loop()
     wav = tmp_path / "break.wav"

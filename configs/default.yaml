@@ -65,8 +65,9 @@ drums:
     model: drumsep_roformer   # legacy label for the larsnet/external paths
     parts: [kick, snare, toms, other]   # inagoy/drumsep emits these 4
     from_input: false         # true = tear down the raw input loop (skip needing a drums stem)
-    # inagoy/drumsep: a Demucs checkpoint, auto-downloaded to models/drumsep/ on first use
-    inagoy_url: https://huggingface.co/mnstrmnl/drumsep/resolve/main/drumsep.th
+    # inagoy/drumsep: a Demucs checkpoint, auto-downloaded to models/drumsep/ on first use.
+    # Public, non-gated MIT mirror (the old mnstrmnl/drumsep URL now returns 401).
+    inagoy_url: https://huggingface.co/Eddycrack864/Drumsep/resolve/main/modelo_final.th
     inagoy_model_dir: models/drumsep
     # uvr drum path (isolated venv) — audio-separator has no per-hit model, kept as an option
     uvr_model: null

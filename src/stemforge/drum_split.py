@@ -211,10 +211,10 @@ def _ensure_inagoy_checkpoint(cfg: "DrumSplitCfg") -> Path:
 def _load_inagoy_model(cfg: "DrumSplitCfg", device: str):
     """Download (if needed) + load the inagoy drumsep Demucs checkpoint."""
     dest = _ensure_inagoy_checkpoint(cfg)
-    from demucs.states import load_model  # lazy: main-env demucs
+    from demucs.states import load_model  # lazy: main-env demucs (MNFE -> caller skips)
 
     try:
-        model = load_model(str(dest))
+        model = _load_demucs_checkpoint(load_model, dest)
     except Exception as e:  # noqa: BLE001 - corrupt/incompatible checkpoint -> fail soft
         raise _DrumModelUnavailable(
             f"could not load inagoy drumsep checkpoint {dest.name} ({e}); "
@@ -223,6 +223,35 @@ def _load_inagoy_model(cfg: "DrumSplitCfg", device: str):
     model.to(device)
     model.eval()
     return model, dest.name
+
+
+def _load_demucs_checkpoint(load_model, dest: Path):
+    """Load a trusted demucs checkpoint across torch versions.
+
+    torch>=2.6 flipped ``torch.load(weights_only=True)`` on by default, which
+    rejects the pickled demucs model classes (``UnpicklingError: Unsupported
+    global: GLOBAL demucs.hdemucs.HDemucs was not an allowed global by
+    default``). The drumsep checkpoint is a trusted MIT file, so on that failure
+    we retry with ``weights_only=False`` (``demucs.states.load_model`` doesn't
+    expose the flag, so we patch ``torch.load`` for the retry). On older torch
+    the first attempt already succeeds and the retry never runs.
+    """
+    try:
+        return load_model(str(dest))
+    except Exception:  # noqa: BLE001 - retry allowing the trusted full unpickle
+        import torch
+
+        orig_load = torch.load
+
+        def _trusted_load(*args, **kwargs):
+            kwargs["weights_only"] = False
+            return orig_load(*args, **kwargs)
+
+        torch.load = _trusted_load
+        try:
+            return load_model(str(dest))
+        finally:
+            torch.load = orig_load
 
 
 # --------------------------------------------------------------------------- #

@@ -120,9 +120,14 @@ installed `demucs` package (it's a Demucs checkpoint — no venv, GPU-fast).
 
 `drums.split.backend = demucs_inagoy` (default) — `drum_split._demucs_inagoy_split`:
 - **Checkpoint**: auto-downloaded on first use to `drums.split.inagoy_model_dir`
-  (`models/drumsep/`, git-ignored) from `drums.split.inagoy_url` (overridable).
-  Loaded with `demucs.states.load_model` and applied via the shared
-  `separate.apply_model_to_audio` (same normalization as stem separation).
+  (`models/drumsep/`, git-ignored) from `drums.split.inagoy_url` (overridable) —
+  the public, non-gated `Eddycrack864/Drumsep/modelo_final.th` mirror (the old
+  `mnstrmnl/drumsep` URL is now gated → HTTP 401). Loaded with
+  `demucs.states.load_model` and applied via the shared
+  `separate.apply_model_to_audio`. **torch≥2.6:** `torch.load` defaults
+  `weights_only=True`, which rejects the pickled `HDemucs`/`HTDemucs` globals;
+  `_load_demucs_checkpoint` retries with `weights_only=False` (trusted MIT file)
+  — works on older torch too, fail-soft on genuine corruption.
 - **Mapping**: the model's 4 sources → canonical kick/snare/toms/other by
   keyword (English or Spanish labels), with a positional kit-order fallback so
   nothing is dropped (`_map_inagoy_sources`).
