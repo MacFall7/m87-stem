@@ -110,7 +110,7 @@ def _analyze_beat_this(audio: AudioTensor, device: str, regression: bool) -> Bea
         bpm_confidence=_bpm_confidence(beats, regression),
         bpm_candidates=_bpm_candidates(bpm),
         meter_confidence=_meter_confidence(beats, downbeats),
-        tempo_assumed=(bpm <= 0.0),
+        tempo_assumed=bool(bpm <= 0.0),   # plain bool — the evidence contract is plain types
     )
 
 
@@ -161,7 +161,7 @@ def _bpm_from_beats(beats: list[float], regression: bool) -> float:
         slope, _ = np.polyfit(idx, arr, 1)  # seconds per beat
         if slope <= 0:
             return 0.0
-        return 60.0 / slope
+        return float(60.0 / slope)   # plain float — np.polyfit returns np.float64
     intervals = np.diff(arr)
     med = float(np.median(intervals))
     return 60.0 / med if med > 0 else 0.0
@@ -194,6 +194,7 @@ def _bpm_candidates(bpm: float) -> list[float]:
     """Always surface the half/double alternates alongside the estimate so a
     half/double detection error is visible, not silently locked in. Empty when
     the BPM is unknown."""
+    bpm = float(bpm)   # plain floats even if a numpy scalar is passed in
     if bpm <= 0:
         return []
     return sorted({round(bpm, 3), round(bpm / 2, 3), round(bpm * 2, 3)})
