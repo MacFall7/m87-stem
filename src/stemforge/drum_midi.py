@@ -11,6 +11,16 @@ Regardless of source, **velocity** comes from each part's RMS loudness envelope
 (equal-ish weighting, configurable window/hop): the max RMS in a short window
 after each onset, scaled to MIDI 1–127. The 5→7 expansion (open/closed hi-hat via
 a decay test) is applied on the hi-hat part.
+
+The default ``demucs_inagoy`` backend bundles every cymbal into one ``other``
+stem. :func:`canonical_drum_part` routes that stem to a ``cymbals`` super-class
+whose onsets are classified per-hit (spectral centroid, HF-energy ratio, decay,
+transient/sustain) into closed/open hi-hat, ride, or crash — so the default path
+emits cymbal MIDI instead of silently dropping it. Onsets that fail the energy or
+high-frequency gate are rejected; genuinely ambiguous cymbals go to a configurable
+generic note (or are dropped). Per-class and rejected counts are reported in the
+manifest. Explicit ``hihat``/``ride``/``crash`` parts (UVR full-kit path) survive
+unchanged.
 """
 
 from __future__ import annotations
@@ -95,6 +105,46 @@ def _adt_external(cmd_template: str, drums_path: PathLike | None, out_dir: Path)
 
 
 # --------------------------------------------------------------------------- #
+# Boundary adapter: normalize an incoming drum-part LABEL to a canonical part
+# --------------------------------------------------------------------------- #
+# The default ``demucs_inagoy`` backend bundles ALL cymbals into a single
+# ``other`` stem (drum_split maps platillos/cymbals/hihat/ride/crash there), so a
+# part labeled ``other``/``platillos`` maps to the ``cymbals`` super-class, which
+# is classified per-onset below. Explicit ``hihat``/``ride``/``crash`` labels
+# (e.g. from the UVR 6-stem path) survive as themselves. This adapter lives in
+# drum_midi only — it renames nothing on disk and does not touch drum_split's own
+# part mapping (no repo-wide rename).
+_DRUM_PART_ALIASES: dict[str, tuple[str, ...]] = {
+    "kick": ("kick", "bd", "bassdrum", "bass drum", "bombo"),
+    "snare": ("snare", "sd", "caja", "redoblante"),
+    "toms": ("toms", "tom"),
+    "hihat": ("hihat", "hi-hat", "hh", "hat"),
+    "ride": ("ride",),
+    "crash": ("crash",),
+    "cymbals": ("cymbals", "cymbal", "cym", "platillos", "other"),
+}
+
+
+def canonical_drum_part(part: str) -> str | None:
+    """Map an incoming part label to a canonical drum part, or ``None`` if unknown.
+
+    ``other``/``platillos`` (the inagoy cymbal bucket) → ``cymbals`` (per-onset
+    classified); explicit ``hihat``/``ride``/``crash`` survive unchanged so the
+    UVR full-kit path is never re-bucketed.
+    """
+    low = (part or "").strip().lower()
+    if not low:
+        return None
+    for canon, aliases in _DRUM_PART_ALIASES.items():
+        if low == canon or any(a == low for a in aliases):
+            return canon
+    for canon, aliases in _DRUM_PART_ALIASES.items():  # substring fallback (decorated labels)
+        if any(a in low for a in aliases):
+            return canon
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Parts-based transcription (fully implemented)
 # --------------------------------------------------------------------------- #
 def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, bpm: float) -> dict[str, Any]:
@@ -103,9 +153,12 @@ def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, b
     events: list[tuple[float, int, float]] = []  # (start, note, raw_peak)
     global_peak = 1e-9
     counts: dict[str, int] = {}
+    cymbal_classes: dict[str, int] = {}   # GM-class -> count (default-path evidence)
+    cymbal_rejected = 0                    # onsets in a cymbal bucket that were gated/dropped
 
     for part, file in drum_parts.items():
-        if part not in GM and part != "hihat":
+        canon = canonical_drum_part(part)
+        if canon is None:
             continue
         p = Path(file)
         if not p.is_file():
@@ -115,13 +168,30 @@ def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, b
         sr = audio.sample_rate
         onsets = _onsets(y, sr)
         env, env_t = _rms_env(y, sr, cfg.velocity_window_ms, cfg.velocity_hop_ms)
-        note_fn = _note_selector(part, cfg, y, sr)
-        for t in onsets:
-            peak = _peak_in_window(env, env_t, t, cfg.velocity_window_ms / 1000.0) \
-                if cfg.velocity_from_stems else 1.0
-            events.append((float(t), note_fn(t), float(peak)))
-            global_peak = max(global_peak, peak)
         counts[part] = len(onsets)
+
+        def _peak(t: float) -> float:
+            return _peak_in_window(env, env_t, t, cfg.velocity_window_ms / 1000.0) \
+                if cfg.velocity_from_stems else 1.0
+
+        if canon == "cymbals":
+            for t in onsets:
+                cls = _classify_cymbal(_cymbal_features(y, sr, float(t), cfg), cfg)
+                note = _cymbal_note(cls, cfg)
+                if note is None:              # gated (not a cymbal) or ambiguous-dropped
+                    cymbal_rejected += 1
+                    continue
+                peak = _peak(t)
+                events.append((float(t), note, float(peak)))
+                global_peak = max(global_peak, peak)
+                label = cls if cls in GM else "generic"
+                cymbal_classes[label] = cymbal_classes.get(label, 0) + 1
+        else:
+            note_fn = _note_selector(canon, cfg, y, sr)
+            for t in onsets:
+                peak = _peak(t)
+                events.append((float(t), note_fn(t), float(peak)))
+                global_peak = max(global_peak, peak)
 
     if not events:
         return {"skipped": "no onsets detected in drum parts"}
@@ -143,6 +213,8 @@ def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, b
         "note_count": len(events),
         "onsets_per_part": counts,
         "expanded_7class": bool(cfg.expand_to_7class),
+        "cymbal_classes": cymbal_classes,
+        "cymbal_rejected": cymbal_rejected,
     }
 
 
@@ -151,6 +223,100 @@ def _note_selector(part: str, cfg: "DrumMidiCfg", y: np.ndarray, sr: int) -> Cal
     if part == "hihat" and cfg.expand_to_7class:
         return lambda t: GM["hihat_open"] if _hat_is_open(y, sr, t) else GM["hihat_closed"]
     return lambda t, n=GM.get(part, GM["snare"]): n
+
+
+# --------------------------------------------------------------------------- #
+# Cymbal classification — default inagoy path only (the "other" stem is all
+# cymbals). Thresholds are module defaults, read via getattr(cfg, ...) so the
+# drum-calibration contract (PR-A4) can move them into config without a schema
+# change here. A hit that fails the energy or high-frequency gate is REJECTED
+# (never voiced); a cymbal matching no clear profile is AMBIGUOUS and routed to a
+# configurable generic note or dropped — confidence is never fabricated.
+# --------------------------------------------------------------------------- #
+CYMBAL_HF_CUT_HZ = 6000.0          # boundary for the high-frequency energy ratio
+CYMBAL_MIN_HF_RATIO = 0.30         # below this an onset is bleed/tom spill, not a cymbal
+CYMBAL_MIN_PEAK = 1e-3             # energy floor — quieter onsets are rejected (no flooding)
+CYMBAL_ATTACK_MS = 30.0            # attack window for peak / centroid / HF ratio
+CYMBAL_SUSTAIN_MS = 180.0          # offset at which the sustain RMS is measured (decay probe)
+CYMBAL_CLOSED_DECAY_MAX = 0.30     # sustain/attack RMS <= this => fast decay => closed hi-hat
+CYMBAL_CRASH_DECAY_MIN = 0.55      # >= this => long wash => ride (dark) / crash (bright)
+CYMBAL_BRIGHT_CENTROID_HZ = 7000.0 # bright (hi-hat / crash) vs darker/tonal (ride) split
+CYMBAL_GENERIC_NOTE = GM["hihat_closed"]  # 42 — safe generic when a cymbal is ambiguous
+
+
+def _cfg_num(cfg: "DrumMidiCfg", name: str, default: float) -> float:
+    v = getattr(cfg, name, default)
+    return default if v is None else float(v)
+
+
+def _cymbal_features(y: np.ndarray, sr: int, t: float, cfg: "DrumMidiCfg") -> dict[str, float]:
+    """Spectral + temporal features of one onset in a cymbal stem:
+    ``peak`` (attack amplitude), ``centroid`` (Hz), ``hf_ratio`` (energy above the
+    HF cut / total), ``decay`` (sustain-RMS / attack-RMS — higher = longer wash)."""
+    attack_ms = _cfg_num(cfg, "cymbal_attack_ms", CYMBAL_ATTACK_MS)
+    sustain_ms = _cfg_num(cfg, "cymbal_sustain_ms", CYMBAL_SUSTAIN_MS)
+    hf_cut = _cfg_num(cfg, "cymbal_hf_cut_hz", CYMBAL_HF_CUT_HZ)
+
+    i0 = max(0, int(t * sr))
+    n = max(1, int(attack_ms / 1000.0 * sr))
+    seg = y[i0:i0 + n].astype(np.float64)
+    if seg.size < 2:
+        return {"peak": 0.0, "centroid": 0.0, "hf_ratio": 0.0, "decay": 0.0}
+
+    peak = float(np.max(np.abs(seg)))
+    spec = np.abs(np.fft.rfft(seg * np.hanning(seg.size)))
+    freqs = np.fft.rfftfreq(seg.size, d=1.0 / sr)
+    total = float(spec.sum()) + 1e-12
+    centroid = float((freqs * spec).sum() / total)
+    hf_ratio = float(spec[freqs >= hf_cut].sum() / total)
+
+    a = _rms_at(y, i0, n)
+    b = _rms_at(y, i0 + int(sustain_ms / 1000.0 * sr), n)
+    decay = float(b / a) if a > 1e-9 else 0.0
+    return {"peak": peak, "centroid": centroid, "hf_ratio": hf_ratio, "decay": decay}
+
+
+def _classify_cymbal(feat: dict[str, float], cfg: "DrumMidiCfg") -> str | None:
+    """Map cymbal-onset features to a GM cymbal class.
+
+    Returns one of ``hihat_closed``/``hihat_open``/``ride``/``crash``; the sentinel
+    ``"reject"`` when the onset fails the energy/HF gate (not a cymbal); or ``None``
+    when it is a cymbal but matches no clear profile (ambiguous — the caller applies
+    the generic-or-drop policy). No class is ever fabricated on weak evidence.
+    """
+    min_peak = _cfg_num(cfg, "cymbal_min_peak", CYMBAL_MIN_PEAK)
+    min_hf = _cfg_num(cfg, "cymbal_min_hf_ratio", CYMBAL_MIN_HF_RATIO)
+    closed_max = _cfg_num(cfg, "cymbal_closed_decay_max", CYMBAL_CLOSED_DECAY_MAX)
+    crash_min = _cfg_num(cfg, "cymbal_crash_decay_min", CYMBAL_CRASH_DECAY_MIN)
+    bright = _cfg_num(cfg, "cymbal_bright_centroid_hz", CYMBAL_BRIGHT_CENTROID_HZ)
+
+    if feat["peak"] < min_peak or feat["hf_ratio"] < min_hf:
+        return "reject"
+    decay, centroid = feat["decay"], feat["centroid"]
+    if decay <= closed_max:
+        return "hihat_closed"
+    if decay >= crash_min:
+        return "ride" if centroid < bright else "crash"
+    if centroid >= bright:
+        return "hihat_open"
+    return None  # ambiguous cymbal -> generic-or-drop
+
+
+def _cymbal_note(cls: str | None, cfg: "DrumMidiCfg") -> int | None:
+    """Resolve a cymbal class to a GM note, honoring the ambiguity policy.
+
+    ``reject`` → ``None`` (gated, no event). A concrete class → its GM note. An
+    ambiguous cymbal (``cls is None``) → a configurable generic note, or ``None``
+    when ``cfg.cymbal_ambiguous == "drop"``.
+    """
+    if cls == "reject":
+        return None
+    if cls in GM:
+        return GM[cls]
+    policy = str(getattr(cfg, "cymbal_ambiguous", "generic") or "generic").strip().lower()
+    if policy == "drop":
+        return None
+    return int(_cfg_num(cfg, "cymbal_generic_note", CYMBAL_GENERIC_NOTE))
 
 
 # --------------------------------------------------------------------------- #
