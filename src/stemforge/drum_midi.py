@@ -29,7 +29,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -47,7 +47,10 @@ GM = {
     "hihat": 42,        # closed by default
     "hihat_closed": 42,
     "hihat_open": 46,
-    "toms": 47,         # mid tom
+    "toms": 47,         # mid tom (default when tom-split is off)
+    "toms_low": 45,     # low/floor tom
+    "toms_mid": 47,
+    "toms_high": 50,    # high tom
     "ride": 51,
     "crash": 49,
 }
@@ -156,16 +159,15 @@ def canonical_drum_part(part: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Parts-based transcription (fully implemented)
+# Parts-based transcription (calibrated — PR-A4)
 # --------------------------------------------------------------------------- #
 def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, bpm: float) -> dict[str, Any]:
     import pretty_midi
 
-    events: list[tuple[float, int, float]] = []  # (start, note, raw_peak)
-    global_peak = 1e-9
+    raw_events: list[dict[str, Any]] = []   # {time, part, note, raw_strength}
     counts: dict[str, int] = {}
-    cymbal_classes: dict[str, int] = {}   # GM-class -> count (default-path evidence)
-    cymbal_rejected = 0                    # onsets in a cymbal bucket that were gated/dropped
+    cymbal_classes: dict[str, int] = {}     # GM-class -> count (default-path evidence)
+    cymbal_rejected = 0                      # onsets in a cymbal bucket that were gated/dropped
 
     for part, file in drum_parts.items():
         canon = canonical_drum_part(part)
@@ -185,35 +187,43 @@ def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, b
             return _peak_in_window(env, env_t, t, cfg.velocity_window_ms / 1000.0) \
                 if cfg.velocity_from_stems else 1.0
 
-        if canon == "cymbals":
-            for t in onsets:
+        for t in onsets:
+            if canon == "cymbals":
                 cls = _classify_cymbal(_cymbal_features(y, sr, float(t), cfg), cfg)
                 note = _cymbal_note(cls, cfg)
-                if note is None:              # gated (not a cymbal) or ambiguous-dropped
+                if note is None:            # gated (not a cymbal) or ambiguous-dropped
                     cymbal_rejected += 1
                     continue
-                peak = _peak(t)
-                events.append((float(t), note, float(peak)))
-                global_peak = max(global_peak, peak)
                 label = cls if cls in GM else "generic"
                 cymbal_classes[label] = cymbal_classes.get(label, 0) + 1
-        else:
-            note_fn = _note_selector(canon, cfg, y, sr)
-            for t in onsets:
-                peak = _peak(t)
-                events.append((float(t), note_fn(t), float(peak)))
-                global_peak = max(global_peak, peak)
+            elif canon == "toms":
+                note = _tom_note(y, sr, float(t), cfg)
+            elif canon == "hihat":
+                note = _hihat_note(y, sr, float(t), cfg)
+            else:
+                note = GM.get(canon, GM["snare"])
+            raw_events.append({"time": float(t), "part": canon, "note": int(note),
+                               "raw_strength": float(_peak(t))})
 
-    if not events:
+    if not raw_events:
         return {"skipped": "no onsets detected in drum parts"}
+
+    _normalize_velocities(raw_events, cfg)                       # per-part, then kit balance
+    kept, duplicates_removed = _dedupe_cross_part(raw_events, cfg)
 
     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
     inst = pretty_midi.Instrument(program=0, is_drum=True, name="drums")
-    for start, note, peak in events:
-        vel = _scale_velocity(peak, global_peak) if cfg.velocity_from_stems else 100
-        inst.notes.append(pretty_midi.Note(velocity=vel, pitch=note,
-                                            start=start, end=start + NOTE_LEN_S))
-    inst.notes.sort(key=lambda n: n.start)
+    records: list[dict[str, Any]] = []
+    for e in sorted(kept, key=lambda x: x["time"]):
+        vel = _velocity_from_norm(e["normalized_strength"]) if cfg.velocity_from_stems else 100
+        inst.notes.append(pretty_midi.Note(velocity=vel, pitch=e["note"],
+                                            start=e["time"], end=e["time"] + NOTE_LEN_S))
+        records.append({
+            "time": round(e["time"], 4), "part": e["part"], "note": e["note"],
+            "raw_strength": round(e["raw_strength"], 6),
+            "normalized_strength": round(e["normalized_strength"], 4),
+            "velocity": vel,
+        })
     pm.instruments.append(inst)
 
     target = out_dir / "drums.mid"
@@ -221,19 +231,107 @@ def _from_parts(drum_parts: dict[str, str], cfg: "DrumMidiCfg", out_dir: Path, b
     return {
         "source": "parts",
         "file": str(target),
-        "note_count": len(events),
+        "note_count": len(kept),
         "onsets_per_part": counts,
         "expanded_7class": bool(cfg.expand_to_7class),
         "cymbal_classes": cymbal_classes,
         "cymbal_rejected": cymbal_rejected,
+        "duplicates_removed": duplicates_removed,
+        "events": records,
     }
 
 
-def _note_selector(part: str, cfg: "DrumMidiCfg", y: np.ndarray, sr: int) -> Callable[[float], int]:
-    """Return a function onset_time -> GM note, applying 5->7 hi-hat expansion."""
-    if part == "hihat" and cfg.expand_to_7class:
-        return lambda t: GM["hihat_open"] if _hat_is_open(y, sr, t) else GM["hihat_closed"]
-    return lambda t, n=GM.get(part, GM["snare"]): n
+# --------------------------------------------------------------------------- #
+# Calibration: per-part velocity normalization, cross-part de-dup, part voicing
+# --------------------------------------------------------------------------- #
+def _normalize_velocities(events: list[dict[str, Any]], cfg: "DrumMidiCfg") -> None:
+    """Normalize each part against its own ~98th-percentile strength (so a quiet
+    hi-hat and a loud kick both use the full velocity range and ghost notes stay
+    audible), then apply the kit-level balance gain. Adds ``normalized_strength``."""
+    pct = float(getattr(cfg, "velocity_percentile", 98.0))
+    balance = getattr(cfg, "kit_balance", {}) or {}
+    by_part: dict[str, list[dict[str, Any]]] = {}
+    for e in events:
+        by_part.setdefault(e["part"], []).append(e)
+    for part, evs in by_part.items():
+        strengths = np.asarray([e["raw_strength"] for e in evs], dtype=np.float64)
+        ref = float(np.percentile(strengths, pct)) if strengths.size else 1.0
+        if ref <= 1e-9:
+            ref = float(strengths.max()) if strengths.size else 1.0
+        ref = ref if ref > 1e-9 else 1.0
+        gain = float(balance.get(part, 1.0))
+        for e in evs:
+            e["normalized_strength"] = float(np.clip(e["raw_strength"] / ref * gain, 0.0, 1.0))
+
+
+def _dedupe_cross_part(events: list[dict[str, Any]], cfg: "DrumMidiCfg",
+                       ) -> tuple[list[dict[str, Any]], int]:
+    """Cluster onsets within ``dedupe_window_ms`` and drop a CROSS-part hit that is
+    clearly weaker than the loudest in the cluster (separation bleed) — keeping the
+    most probable. Comparable simultaneous hits (a real kick+snare) and same-part
+    ghost notes survive, since only clearly-weaker cross-part coincidences go."""
+    if not events:
+        return [], 0
+    win = float(getattr(cfg, "dedupe_window_ms", 18.0)) / 1000.0
+    ratio = float(getattr(cfg, "dedupe_weak_ratio", 0.5))
+    order = sorted(events, key=lambda e: e["time"])
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and order[j + 1]["time"] - order[i]["time"] <= win:
+            j += 1
+        cluster = order[i:j + 1]
+        if len(cluster) == 1:
+            kept.append(cluster[0])
+        else:
+            strongest = max(cluster, key=lambda e: e["raw_strength"])
+            for e in cluster:
+                if e is strongest:
+                    kept.append(e)
+                elif e["part"] != strongest["part"] and \
+                        e["raw_strength"] < ratio * strongest["raw_strength"]:
+                    removed += 1                      # separation bleed → drop
+                else:
+                    kept.append(e)                    # same-part or comparable → keep
+        i = j + 1
+    return kept, removed
+
+
+def _velocity_from_norm(norm: float) -> int:
+    """Normalized strength (0..1) -> MIDI velocity with a floor so ghosts stay audible."""
+    ratio = float(np.clip(norm, 0.0, 1.0)) ** 0.5   # perceptual-ish compression
+    return int(np.clip(round(10 + 117 * ratio), 1, 127))
+
+
+def _hihat_note(y: np.ndarray, sr: int, t: float, cfg: "DrumMidiCfg") -> int:
+    if cfg.expand_to_7class and _hat_is_open(y, sr, t, cfg):
+        return GM["hihat_open"]
+    return GM["hihat_closed"]
+
+
+def _tom_note(y: np.ndarray, sr: int, t: float, cfg: "DrumMidiCfg") -> int:
+    """Split toms into low/mid/high by the onset's dominant pitch."""
+    if not getattr(cfg, "tom_split", True):
+        return GM["toms"]
+    hz = _dominant_hz(y, sr, t)
+    if hz < float(getattr(cfg, "tom_low_hz", 100.0)):
+        return GM["toms_low"]
+    if hz < float(getattr(cfg, "tom_mid_hz", 220.0)):
+        return GM["toms_mid"]
+    return GM["toms_high"]
+
+
+def _dominant_hz(y: np.ndarray, sr: int, t: float, win_ms: float = 60.0) -> float:
+    """Dominant (peak-magnitude) frequency in a short window after the onset."""
+    i0 = max(0, int(t * sr))
+    seg = y[i0:i0 + max(1, int(win_ms / 1000.0 * sr))].astype(np.float64)
+    if seg.size < 4:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(seg.size)))
+    freqs = np.fft.rfftfreq(seg.size, d=1.0 / sr)
+    return float(freqs[int(np.argmax(spec))])
 
 
 # --------------------------------------------------------------------------- #
@@ -357,20 +455,20 @@ def _peak_in_window(env: np.ndarray, env_t: np.ndarray, t: float, window_s: floa
     return float(np.max(env[mask]))
 
 
-def _scale_velocity(peak: float, global_peak: float) -> int:
-    """Perceptual-ish scaling: sqrt compression, floor at 10 so hits stay audible."""
-    ratio = (peak / global_peak) ** 0.5 if global_peak > 0 else 0.0
-    return int(np.clip(round(10 + 117 * ratio), 1, 127))
+def _hat_is_open(y: np.ndarray, sr: int, t: float, cfg: "DrumMidiCfg" = None) -> bool:
+    """Open vs closed hi-hat via decay: open hats sustain, closed die fast.
 
-
-def _hat_is_open(y: np.ndarray, sr: int, t: float, short_ms: float = 25.0, long_ms: float = 130.0) -> bool:
-    """Open vs closed hi-hat via decay: open hats sustain, closed die fast."""
+    Windows and the decay ratio are configurable (PR-A4); the defaults reproduce
+    the previous hard-coded behavior."""
+    short_ms = _cfg_num(cfg, "hat_open_short_ms", 25.0) if cfg is not None else 25.0
+    long_ms = _cfg_num(cfg, "hat_open_long_ms", 130.0) if cfg is not None else 130.0
+    ratio = _cfg_num(cfg, "hat_open_ratio", 0.35) if cfg is not None else 0.35
     i0 = int(t * sr)
     a = _rms_at(y, i0, int(short_ms / 1000.0 * sr))
     b = _rms_at(y, i0 + int(long_ms / 1000.0 * sr), int(short_ms / 1000.0 * sr))
     if a <= 1e-9:
         return False
-    return (b / a) > 0.35  # still ringing well after the hit => open
+    return (b / a) > ratio  # still ringing well after the hit => open
 
 
 def _rms_at(y: np.ndarray, start: int, length: int) -> float:

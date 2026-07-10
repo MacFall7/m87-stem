@@ -217,12 +217,12 @@ def test_manifest_reports_cymbal_counts(tmp_path):
                for k in res["cymbal_classes"])
 
 
-def test_stock_config_needs_no_new_fields(tmp_path):
-    """Prior configs parse unchanged: the stock DrumMidiCfg has no cymbal_* fields,
-    yet the cymbal path runs with module defaults (getattr fallbacks)."""
+def test_cymbal_config_defaults_and_still_voices(tmp_path):
+    """The cymbal knobs are config-ified (PR-A4) with sane defaults; a stock config
+    carries them and the cymbal path still voices via the generic policy."""
     cfg = _midi_cfg()
-    assert not hasattr(cfg, "cymbal_ambiguous")     # not a dataclass field
-    assert not hasattr(cfg, "cymbal_generic_note")
+    assert cfg.cymbal_ambiguous == "generic"
+    assert cfg.cymbal_generic_note == 42
     parts = {"other": _write(tmp_path / "other.wav", _cymbal_bucket())}
     res = drum_midi._from_parts(parts, cfg, ensure_dir(tmp_path / "out"), bpm=120.0)
-    assert sum(res["cymbal_classes"].values()) >= 1  # defaults -> generic policy, still voices
+    assert sum(res["cymbal_classes"].values()) >= 1

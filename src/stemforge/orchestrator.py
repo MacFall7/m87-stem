@@ -201,6 +201,45 @@ class DrumMidiCfg:
     velocity_window_ms: float = 50.0
     velocity_hop_ms: float = 10.0
     external_cmd: str | None = None
+    # --- Calibration (PR-A4) --------------------------------------------- #
+    velocity_percentile: float = 98.0        # per-part reference level (robust to a stray peak)
+    dedupe_window_ms: float = 18.0           # cross-part coincidence window
+    dedupe_weak_ratio: float = 0.5           # drop a coincident cross-part hit weaker than this × the loudest
+    # Hi-hat open/closed decay test (was hard-coded).
+    hat_open_short_ms: float = 25.0
+    hat_open_long_ms: float = 130.0
+    hat_open_ratio: float = 0.35
+    # Toms split low/mid/high by dominant pitch.
+    tom_split: bool = True
+    tom_low_hz: float = 100.0                # < low_hz => low tom
+    tom_mid_hz: float = 220.0                # < mid_hz => mid tom, else high tom
+    # Cymbal onset classifier (config-ified from PR-A1 module defaults).
+    cymbal_hf_cut_hz: float = 6000.0
+    cymbal_min_hf_ratio: float = 0.30
+    cymbal_min_peak: float = 1e-3
+    cymbal_attack_ms: float = 30.0
+    cymbal_sustain_ms: float = 180.0
+    cymbal_closed_decay_max: float = 0.30
+    cymbal_crash_decay_min: float = 0.55
+    cymbal_bright_centroid_hz: float = 7000.0
+    cymbal_ambiguous: str = "generic"        # "generic" | "drop"
+    cymbal_generic_note: int = 42
+
+    def validate(self) -> "DrumMidiCfg":
+        """Fail fast on an out-of-range calibration value (config validated, A4)."""
+        if not 0.0 < self.velocity_percentile <= 100.0:
+            raise ValueError(f"velocity_percentile must be in (0,100], got {self.velocity_percentile}")
+        if self.dedupe_window_ms < 0:
+            raise ValueError(f"dedupe_window_ms must be >= 0, got {self.dedupe_window_ms}")
+        if not 0.0 <= self.dedupe_weak_ratio <= 1.0:
+            raise ValueError(f"dedupe_weak_ratio must be in [0,1], got {self.dedupe_weak_ratio}")
+        if self.cymbal_ambiguous not in {"generic", "drop"}:
+            raise ValueError(f"cymbal_ambiguous must be 'generic' or 'drop', got {self.cymbal_ambiguous!r}")
+        if not 0.0 <= self.cymbal_min_hf_ratio <= 1.0:
+            raise ValueError(f"cymbal_min_hf_ratio must be in [0,1], got {self.cymbal_min_hf_ratio}")
+        if self.tom_low_hz > self.tom_mid_hz:
+            raise ValueError(f"tom_low_hz ({self.tom_low_hz}) must be <= tom_mid_hz ({self.tom_mid_hz})")
+        return self
 
 
 @dataclass
@@ -264,7 +303,9 @@ def load_config(path: PathLike | None = None, overrides: dict[str, Any] | None =
             overrides["separation.preset"] = key  # normalized for the manifest
     for dotted, value in overrides.items():
         _set_dotted(data, dotted, value)
-    return _build(RunConfig, data)
+    cfg = _build(RunConfig, data)
+    cfg.drums.midi.validate()   # fail fast on an out-of-range drum-calibration value (A4)
+    return cfg
 
 
 def _set_dotted(d: dict[str, Any], dotted: str, value: Any) -> None:
