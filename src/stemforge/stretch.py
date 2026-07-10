@@ -16,7 +16,15 @@ from typing import Any
 
 import numpy as np
 
-from .io_utils import AudioTensor, PathLike, load_audio, save_audio, slugify
+from .io_utils import (
+    AudioTensor,
+    EngineAttempt,
+    PathLike,
+    load_audio,
+    sanitize_reason,
+    save_audio,
+    slugify,
+)
 
 try:  # pragma: no cover
     from .orchestrator import StretchCfg
@@ -41,6 +49,7 @@ def stretch_with_engine(
     engine: str = "rubberband",
     crisp: int = 5,
     preserve_formant: bool = False,
+    attempts: list[dict] | None = None,
 ) -> tuple[AudioTensor, str]:
     """Stretch and report the engine ACTUALLY used (after any fallback).
 
@@ -48,20 +57,36 @@ def stretch_with_engine(
     the engine that actually produced the audio — so callers record the truth,
     not the request (the old code fell through to librosa without ever updating
     the label). Identity ratio does no work and reports ``"none"``.
+
+    When an ``attempts`` list is supplied, each hop appends a sanitized
+    :class:`EngineAttempt` record — so the reason a higher-quality engine fell
+    through (previously swallowed by a bare ``except``) is captured as evidence.
     """
+    def _rec(eng: str, status: str, reason: str = "") -> None:
+        if attempts is not None:
+            attempts.append(EngineAttempt(eng, status, reason).to_dict())
+
     if abs(ratio - 1.0) < 1e-6:
+        _rec("none", "used")
         return audio, "none"
     if engine == "rubberband":
         try:
-            return _rubberband(audio, ratio, crisp, preserve_formant), "rubberband"
-        except Exception:
+            out = _rubberband(audio, ratio, crisp, preserve_formant)
+            _rec("rubberband", "used")
+            return out, "rubberband"
+        except Exception as e:  # noqa: BLE001 - degrade, but record why
+            _rec("rubberband", "fell_through", sanitize_reason(e))
             engine = "signalsmith"
     if engine == "signalsmith":
         try:
-            return _signalsmith(audio, ratio), "signalsmith"
-        except Exception:
-            pass
-    return _librosa(audio, ratio), "librosa"
+            out = _signalsmith(audio, ratio)
+            _rec("signalsmith", "used")
+            return out, "signalsmith"
+        except Exception as e:  # noqa: BLE001 - degrade, but record why
+            _rec("signalsmith", "fell_through", sanitize_reason(e))
+    out = _librosa(audio, ratio)
+    _rec("librosa", "used")
+    return out, "librosa"
 
 
 def time_stretch(
@@ -168,15 +193,18 @@ def match_bpm_file(
             return {"skipped": "no detectable BPM; pass source_bpm to override"}
 
         ratio = float(target_bpm) / src
-        out, used_engine = stretch_with_engine(audio, ratio, engine=engine, crisp=crisp)
+        attempts: list[dict] = []
+        out, used_engine = stretch_with_engine(audio, ratio, engine=engine, crisp=crisp,
+                                               attempts=attempts)
         stem = out_name or f"{slugify(Path(input_path).stem)}_{int(round(float(target_bpm)))}bpm.wav"
         outp = save_audio(Path(out_dir) / stem, out)
     except Exception as e:  # noqa: BLE001 - never raise; surface as a soft error
-        return {"error": f"match-bpm failed: {e}"}
+        return {"error": f"match-bpm failed: {sanitize_reason(e)}"}
 
     return {
         "engine": used_engine,           # actual engine after any fallback
         "engine_requested": engine,
+        "attempts": attempts,            # per-hop fallback evidence (sanitized)
         "detect_engine": detect_engine,
         "source_bpm": round(src, 3),
         "source_bpm_detected": round(detected, 3),
@@ -213,6 +241,7 @@ def stretch_stems(
         "files": {},
     }
     engines_used: list[str] = []
+    attempts_all: list[dict] = []
     for name, path in stems.items():
         target = cfg.per_stem_target_bpm.get(name, cfg.target_bpm)
         if not target:
@@ -221,7 +250,7 @@ def stretch_stems(
         audio = load_audio(path)
         formant = cfg.preserve_formant and name == "vocals"
         out, used = stretch_with_engine(audio, ratio, engine=cfg.engine, crisp=cfg.crisp,
-                                        preserve_formant=formant)
+                                        preserve_formant=formant, attempts=attempts_all)
         engines_used.append(used)
         outp = save_audio(out_dir / f"{name}_{int(round(float(target)))}bpm.wav", out)
         result["ratios"][name] = round(ratio, 4)
@@ -229,4 +258,14 @@ def stretch_stems(
     if engines_used:
         uniq = sorted(set(engines_used))
         result["engine"] = uniq[0] if len(uniq) == 1 else uniq
+    # Dedupe the per-stem hops (the chain is the same for every stem) but keep the
+    # sanitized fall-through reasons as manifest evidence.
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict] = []
+    for a in attempts_all:
+        key = (a["engine"], a["status"], a["reason"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(a)
+    result["attempts"] = deduped
     return result

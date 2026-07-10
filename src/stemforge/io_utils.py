@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,42 @@ import numpy as np
 import soundfile as sf
 
 PathLike = str | Path
+
+
+# --------------------------------------------------------------------------- #
+# Engine fallback evidence (shared by analysis + stretch)
+# --------------------------------------------------------------------------- #
+@dataclass
+class EngineAttempt:
+    """One hop in an engine fallback chain — the analysis beat_this→librosa hop or
+    the stretch rubberband→signalsmith→librosa chain.
+
+    ``status`` is ``"used"`` (this engine produced the output), ``"fell_through"``
+    (it failed and the chain continued), or ``"failed"``. ``reason`` is a
+    sanitized, single-line message (no absolute paths or subprocess dumps), empty
+    when the engine was used.
+    """
+
+    engine: str
+    status: str
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {"engine": self.engine, "status": self.status, "reason": self.reason}
+
+
+_PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/)[\w./\\-]+")
+
+
+def sanitize_reason(err: Any, limit: int = 200) -> str:
+    """A deterministic, log-safe reason string for a fallback record: drop
+    absolute paths, collapse newlines/whitespace (kills multi-line subprocess
+    dumps), and truncate — so manifests stay reproducible and leak no host paths.
+    """
+    s = err if isinstance(err, str) else f"{type(err).__name__}: {err}"
+    s = _PATH_RE.sub("<path>", s)
+    s = " ".join(s.split())
+    return s[:limit]
 
 
 # --------------------------------------------------------------------------- #
