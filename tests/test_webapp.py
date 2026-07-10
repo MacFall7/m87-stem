@@ -296,3 +296,36 @@ def test_download_all_still_streams(client):
     out_dir = _poll(client, r.json()["job_id"])["result"]["out_dir"]
     z = client.get("/api/download-all", params={"dir": out_dir})
     assert z.status_code == 200 and z.content[:2] == b"PK"  # streamed from a temp file
+
+
+# --------------------------------------------------------------------------- #
+# C5 (H2v2) AC1 — jobs enqueue on a single-worker executor and are correctly
+# attributed with no cross-contamination (serialized, non-interleaved).
+# --------------------------------------------------------------------------- #
+def test_concurrent_jobs_attributed_and_serialized(client):
+    r1 = client.post("/api/extract", files={"file": ("alpha.wav", _wav_bytes(), "audio/wav")},
+                     data={"preset": "best"})
+    r2 = client.post("/api/extract", files={"file": ("beta.wav", _wav_bytes(), "audio/wav")},
+                     data={"preset": "best"})
+    j1 = _poll(client, r1.json()["job_id"])
+    j2 = _poll(client, r2.json()["job_id"])
+
+    assert j1["status"] == "done" and j2["status"] == "done"
+    assert j1["result"]["out_dir"].endswith(slugify("alpha"))
+    assert j2["result"]["out_dir"].endswith(slugify("beta"))
+    # each job's cards live under its OWN output dir — no cross-attribution
+    assert j1["result"]["cards"] and all("alpha" in c["url"] for c in j1["result"]["cards"])
+    assert j2["result"]["cards"] and all("beta" in c["url"] for c in j2["result"]["cards"])
+
+
+def test_uploads_do_not_spawn_free_threads(client, monkeypatch):
+    """R1: uploads submit to the bounded executor; no raw Thread() is spawned."""
+    import stemforge.webapp as webapp_mod
+
+    def boom(*a, **k):
+        raise AssertionError("uploads must enqueue on the executor, not spawn a Thread")
+
+    monkeypatch.setattr(webapp_mod.threading, "Thread", boom)
+    r = client.post("/api/extract", files={"file": ("mix.wav", _wav_bytes(), "audio/wav")})
+    job = _poll(client, r.json()["job_id"])
+    assert job["status"] == "done"

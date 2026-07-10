@@ -403,11 +403,14 @@ class UvrEngine:
         With ``extra_models`` set, runs audio-separator's native ensemble
         (``-m primary --extra_models m2 … --ensemble_algorithm <algo>``).
         """
-        before = {p for p in self.work_dir.iterdir()}
+        # R2/H2v2: each invocation writes into its OWN fresh subdir, so outputs are
+        # attributed by location — no shared-scratch before/after snapshot diff that
+        # could misattribute a concurrent invocation's files to this call.
+        call_dir = ensure_dir(self.work_dir / f"call-{uuid.uuid4().hex[:12]}")
         cmd = [
             str(self.cli), str(path),
             "--model_filename", self.model_filename,
-            "--output_dir", str(self.work_dir),
+            "--output_dir", str(call_dir),
             "--output_format", "WAV",
             "--model_file_dir", self.model_file_dir,
         ]
@@ -419,15 +422,27 @@ class UvrEngine:
             cmd.append("--use_autocast")
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
+            shutil.rmtree(call_dir, ignore_errors=True)
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
             raise RuntimeError(
                 f"audio-separator exited with {proc.returncode}: " + " | ".join(tail)
             )
-        return sorted(p for p in self.work_dir.iterdir() if p not in before and p.is_file())
+        return sorted(p for p in call_dir.iterdir() if p.is_file())
 
     def separate_file(self, path: PathLike) -> dict[str, Path]:
         """Run the venv CLI on an audio file; return canonical stem name -> path."""
         return {canonical_stem_name(p.name): p for p in self.run(path)}
+
+
+def _cleanup_call_dirs(paths) -> None:
+    """Unlink produced files and remove their per-invocation call dirs (R2)."""
+    dirs: set[Path] = set()
+    for p in paths:
+        p = Path(p)
+        dirs.add(p.parent)
+        p.unlink(missing_ok=True)
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def separate(
@@ -455,8 +470,7 @@ def separate(
         stems = {name: load_audio(p) for name, p in by_name.items()}
     finally:
         in_path.unlink(missing_ok=True)
-        for p in by_name.values():
-            p.unlink(missing_ok=True)
+        _cleanup_call_dirs(by_name.values())
 
     from .separate import _select  # honor cfg.stems the same way the demucs backend does
 
@@ -501,6 +515,5 @@ def separate_drums(
         parts = {canonical_drum_part(p.name): load_audio(p) for p in produced}
     finally:
         in_path.unlink(missing_ok=True)
-        for p in produced:
-            p.unlink(missing_ok=True)
+        _cleanup_call_dirs(produced)
     return parts, model, engine

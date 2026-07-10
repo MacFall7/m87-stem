@@ -37,6 +37,7 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -55,7 +56,7 @@ _STAGE_PROGRESS = {
     "stretch": (0.95, "Time-stretching"),
 }
 
-# In-memory job store: job_id -> {status, progress, stage, message, result, error}
+# In-memory job store: job_id -> {status, progress, stage, message, result, error, outcome}
 _JOBS: dict[str, dict[str, Any]] = {}
 _MODEL_CACHE: dict[str, Any] = {}
 _UPLOAD_DIR = WEB_DIR.parent / ".uploads"  # under the package dir, transient
@@ -104,6 +105,21 @@ def _prune_jobs(now: float | None = None) -> None:
     ]
     for jid in stale:
         _JOBS.pop(jid, None)
+
+
+# R1/H2v2: a single process-wide worker serializes ALL pipeline jobs, so GPU work
+# never overlaps and the shared model cache is touched by one job at a time.
+# Uploads enqueue here (submit) instead of spawning a free thread per request.
+_EXECUTOR: "ThreadPoolExecutor | None" = None
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def _job_executor() -> "ThreadPoolExecutor":
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stemforge-job")
+        return _EXECUTOR
 
 _MELODIC_STEMS = ["bass", "other", "guitar", "piano", "vocals"]
 
@@ -333,8 +349,8 @@ def create_app():
         _JOBS[job_id] = {"status": "queued", "progress": 0.0, "stage": None,
                          "message": "Queued", "result": None, "error": None,
                          "outcome": None, "finished_at": None}
-        threading.Thread(target=run_job, args=(job_id, workflow, dest, params),
-                         daemon=True).start()
+        # Enqueue on the single-worker executor (concurrency 1) — no free thread.
+        _job_executor().submit(run_job, job_id, workflow, dest, params)
         return {"job_id": job_id}
 
     @app.post("/api/extract")
