@@ -1,6 +1,8 @@
+from pathlib import Path
+
 import numpy as np
 
-from stemforge.io_utils import AudioTensor, load_audio, receipt, save_audio, slugify
+from stemforge.io_utils import AudioTensor, load_audio, read_json, receipt, save_audio, slugify, write_json
 
 
 def test_audiotensor_shapes(sine):
@@ -40,3 +42,22 @@ def test_slugify():
     assert slugify("My Song") == "My_Song"
     assert slugify("a/b\\c") == "a_b_c"
     assert slugify("") == "song"
+
+
+def test_write_json_serializes_numpy_scalars(tmp_path):
+    """A manifest can carry any numpy scalar. np.bool_ (the A1 cymbal evidence hit
+    it first) previously crashed write_json — _json_default now covers np.generic."""
+    obj = {
+        "flag": np.bool_(True),          # the case that broke drum teardown on Windows
+        "f": np.float64(1.5),
+        "i": np.int64(7),
+        "arr": np.arange(3),             # ndarray -> list
+        "path": tmp_path / "out",        # Path -> str
+    }
+    p = write_json(tmp_path / "m.json", obj)   # must not raise
+    back = read_json(p)
+    assert back["flag"] is True
+    assert back["f"] == 1.5 and isinstance(back["f"], float)
+    assert back["i"] == 7 and isinstance(back["i"], int)
+    assert back["arr"] == [0, 1, 2]
+    assert back["path"] == str(Path(tmp_path / "out"))
