@@ -184,7 +184,11 @@ def read_json(path: PathLike) -> Any:
 def _json_default(o: Any) -> Any:
     if isinstance(o, np.ndarray):
         return o.tolist()
-    if isinstance(o, (np.floating, np.integer)):
+    # np.generic covers EVERY numpy scalar — bool_, floating, integer — across
+    # numpy 1.x and 2.x (2.0 renamed np.bool_'s repr to numpy.bool). The A1 cymbal
+    # evidence was the first path to put an np.bool_ into a manifest, which the old
+    # (np.floating, np.integer) branch missed → write_json crashed on drum teardown.
+    if isinstance(o, np.generic):
         return o.item()
     if isinstance(o, Path):
         return str(o)

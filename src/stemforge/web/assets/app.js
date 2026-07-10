@@ -186,7 +186,13 @@ function showProgress(frac, msg) {
 async function poll(jobId) {
   for (;;) {
     await new Promise((r) => setTimeout(r, 400));
-    const job = await (await fetch(`/api/job/${jobId}`)).json();
+    const res = await fetch(`/api/job/${jobId}`);
+    // A dead job id (server restarted -> in-memory job store cleared) returns 404.
+    // Stop polling instead of looping forever on the missing job.
+    if (res.status === 404) {
+      return finishError("Job not found (the server was restarted). Please re-run.");
+    }
+    const job = await res.json();
     showProgress(job.progress || 0.05, job.message);
     if (job.status === "done") return renderResults(job.result);
     if (job.status === "error") return finishError(job.error || job.message);

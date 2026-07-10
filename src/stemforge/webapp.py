@@ -295,7 +295,7 @@ def _safe(path_str: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 def create_app():
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title="StemForge", docs_url=None, redoc_url=None)
@@ -318,6 +318,12 @@ def create_app():
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return (WEB_DIR / "index.html").read_text(encoding="utf-8")
+
+    @app.get("/favicon.ico")
+    def favicon() -> Response:
+        # No icon asset is shipped; return 204 so the browser stops logging a 404
+        # on every page load (console noise, not an error).
+        return Response(status_code=204)
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:

@@ -180,7 +180,8 @@ def test_separate_uvr_maps_and_caches(fake_uvr_cli, sine):
     assert cmd[0].endswith("audio-separator")
     assert cmd[cmd.index("--model_filename") + 1] == BS_ROFORMER_MODEL
     assert cmd[cmd.index("--output_format") + 1] == "WAV"
-    assert cmd[cmd.index("--model_file_dir") + 1].endswith("models/uvr")
+    # compare path components, not a "/"-joined suffix — portable across Windows backslashes
+    assert Path(cmd[cmd.index("--model_file_dir") + 1]).parts[-2:] == ("models", "uvr")
     assert "--use_autocast" in cmd
 
     # scratch files are cleaned up after each call
