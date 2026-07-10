@@ -1,6 +1,6 @@
 import numpy as np
 
-from stemforge.drum_midi import GM, _hat_is_open, _peak_in_window, _rms_at, _scale_velocity
+from stemforge.drum_midi import GM, _hat_is_open, _peak_in_window, _rms_at, _velocity_from_norm
 
 
 def test_gm_mapping():
@@ -8,12 +8,13 @@ def test_gm_mapping():
     assert GM["hihat_open"] == 46 and GM["hihat_closed"] == 42
 
 
-def test_scale_velocity_monotonic_and_bounded():
-    vals = [_scale_velocity(p, 1.0) for p in (0.0, 0.25, 0.5, 1.0)]
+def test_velocity_from_norm_monotonic_and_bounded():
+    # PR-A4: velocity now maps normalized (0..1) per-part strength (was global-peak)
+    vals = [_velocity_from_norm(p) for p in (0.0, 0.25, 0.5, 1.0)]
     assert vals == sorted(vals)
     assert all(1 <= v <= 127 for v in vals)
-    assert vals[-1] == 127          # peak == global => full velocity
-    assert _scale_velocity(0.0, 1.0) >= 1  # floor keeps quiet hits audible
+    assert vals[-1] == 127          # full normalized strength => full velocity
+    assert _velocity_from_norm(0.0) >= 1  # floor keeps quiet/ghost hits audible
 
 
 def test_peak_in_window():

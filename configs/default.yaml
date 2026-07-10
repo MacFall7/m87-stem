@@ -96,6 +96,26 @@ drums:
     velocity_window_ms: 50
     velocity_hop_ms: 10
     external_cmd: null
+    # --- Calibration (PR-A4) ---
+    velocity_percentile: 98   # per-part reference level (robust to a stray peak)
+    dedupe_window_ms: 18      # cross-part coincidence window
+    dedupe_weak_ratio: 0.5    # drop a coincident cross-part hit weaker than this x the loudest (bleed)
+    hat_open_short_ms: 25     # hi-hat open/closed decay test
+    hat_open_long_ms: 130
+    hat_open_ratio: 0.35
+    tom_split: true           # split toms low/mid/high by dominant pitch
+    tom_low_hz: 100
+    tom_mid_hz: 220
+    cymbal_hf_cut_hz: 6000    # cymbal onset classifier (config-ified from PR-A1)
+    cymbal_min_hf_ratio: 0.30
+    cymbal_min_peak: 0.001
+    cymbal_attack_ms: 30
+    cymbal_sustain_ms: 180
+    cymbal_closed_decay_max: 0.30
+    cymbal_crash_decay_min: 0.55
+    cymbal_bright_centroid_hz: 7000
+    cymbal_ambiguous: generic # generic | drop
+    cymbal_generic_note: 42
 
 output:
   root: out             # per-song bundle: out/<song>/{stems,midi,drums,stretched}
