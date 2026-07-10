@@ -192,7 +192,13 @@ def test_file_route_rejects_paths_outside_output_root(client, tmp_path):
 
 
 def test_unknown_job_is_404(client):
+    # the SPA poller relies on this 404 to stop polling a dead job after a restart
     assert client.get("/api/job/deadbeef").status_code == 404
+
+
+def test_favicon_returns_204_not_404(client):
+    # a favicon route silences the per-load 404 in the local server console
+    assert client.get("/favicon.ico").status_code == 204
 
 
 # --------------------------------------------------------------------------- #
