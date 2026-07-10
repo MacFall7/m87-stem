@@ -31,6 +31,8 @@ annotations break that (same rule as ``cli.py``).
 
 import io
 import json
+import os
+import tempfile
 import threading
 import time
 import uuid
@@ -57,6 +59,51 @@ _STAGE_PROGRESS = {
 _JOBS: dict[str, dict[str, Any]] = {}
 _MODEL_CACHE: dict[str, Any] = {}
 _UPLOAD_DIR = WEB_DIR.parent / ".uploads"  # under the package dir, transient
+
+# --------------------------------------------------------------------------- #
+# H1 hardening knobs (env-configurable) + helpers
+# --------------------------------------------------------------------------- #
+_MAX_UPLOAD_MB = int(os.environ.get("STEMFORGE_MAX_UPLOAD_MB", "512"))  # R3
+_JOB_TTL_S = float(os.environ.get("STEMFORGE_JOB_TTL_S", "3600"))       # R4
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+_AUTH_TOKEN: str | None = None  # set by launch() when binding a remote host (R1)
+
+
+def _max_upload_bytes() -> int:
+    return max(1, _MAX_UPLOAD_MB) * 1024 * 1024
+
+
+def _is_loopback(host: str) -> bool:
+    return (host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def require_safe_bind(host: str, allow_remote: bool, token: str | None) -> None:
+    """R1: refuse a non-loopback bind unless the operator explicitly opts in AND
+    sets a non-empty token. Localhost stays trust-all (documented default)."""
+    if _is_loopback(host):
+        return
+    if not allow_remote:
+        raise RuntimeError(
+            f"refusing to bind non-loopback host {host!r}: pass allow_remote=True "
+            "(CLI --allow-remote) to expose StemForge beyond localhost")
+    if not token:
+        raise RuntimeError(
+            f"refusing to bind non-loopback host {host!r} without an auth token "
+            "(set STEMFORGE_TOKEN or pass --token)")
+
+
+def _prune_jobs(now: float | None = None) -> None:
+    """R4: drop finished jobs whose completion is older than the TTL, so the
+    in-memory job store cannot grow without bound."""
+    now = time.time() if now is None else now
+    stale = [
+        jid for jid, rec in list(_JOBS.items())
+        if rec.get("status") in {"done", "error"}
+        and rec.get("finished_at") is not None
+        and now - rec["finished_at"] > _JOB_TTL_S
+    ]
+    for jid in stale:
+        _JOBS.pop(jid, None)
 
 _MELODIC_STEMS = ["bass", "other", "guitar", "piano", "vocals"]
 
@@ -128,6 +175,7 @@ def run_job(job_id: str, workflow: str, input_path: Path, params: dict[str, Any]
     except Exception as e:  # noqa: BLE001 - surface as a job error, don't crash the server
         job.update(status="error", progress=1.0, message=str(e), error=str(e))
     finally:
+        job["finished_at"] = time.time()  # R4 — mark completion for TTL eviction
         try:
             input_path.unlink(missing_ok=True)
         except OSError:
@@ -227,6 +275,17 @@ def create_app():
     app = FastAPI(title="StemForge", docs_url=None, redoc_url=None)
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+    # R1 — when a token is configured (remote bind), require it on /api/* routes.
+    # Default localhost binds leave _AUTH_TOKEN None → trust-all-localhost.
+    @app.middleware("http")
+    async def _require_token(request, call_next):
+        if _AUTH_TOKEN and request.url.path.startswith("/api/"):
+            if request.headers.get("x-stemforge-token") != _AUTH_TOKEN:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse({"detail": "missing or invalid token"}, status_code=401)
+        return await call_next(request)
+
     if (WEB_DIR / "assets").is_dir():
         app.mount("/static", StaticFiles(directory=str(WEB_DIR / "assets")), name="static")
 
@@ -239,11 +298,31 @@ def create_app():
         return health_status()
 
     async def _accept(workflow: str, file: UploadFile, params: dict[str, Any]) -> dict[str, str]:
+        _prune_jobs()  # R4 — opportunistically evict old finished jobs
         job_id = uuid.uuid4().hex[:12]
         dest = _UPLOAD_DIR / f"{job_id}_{Path(file.filename or 'input').name}"
-        dest.write_bytes(await file.read())
+        # R3 — stream to disk in chunks with a size cap; never read the whole
+        # upload into RAM, and reject an oversize file before finishing the read.
+        max_bytes = _max_upload_bytes()
+        written = 0
+        try:
+            with open(dest, "wb") as out:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"upload exceeds the {_MAX_UPLOAD_MB} MB limit")
+                    out.write(chunk)
+        except HTTPException:
+            dest.unlink(missing_ok=True)
+            raise
         _JOBS[job_id] = {"status": "queued", "progress": 0.0, "stage": None,
-                         "message": "Queued", "result": None, "error": None}
+                         "message": "Queued", "result": None, "error": None,
+                         "finished_at": None}
         threading.Thread(target=run_job, args=(job_id, workflow, dest, params),
                          daemon=True).start()
         return {"job_id": job_id}
@@ -312,8 +391,8 @@ def create_app():
                 if snap != last:
                     yield f"data: {snap}\n\n"
                     last = snap
-                if job.get("status") in {"done", "error"}:
-                    break
+                if job_id not in _JOBS or job.get("status") in {"done", "error"}:
+                    break  # R4 — also terminate if the job was TTL-evicted
                 time.sleep(0.3)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
@@ -327,21 +406,38 @@ def create_app():
 
     @app.get("/api/download-all")
     def download_all(dir: str):
+        from starlette.background import BackgroundTask
+
         d = Path(dir).resolve()
         if not d.is_dir() or not any(r == d or r in d.parents for r in _allowed_roots()):
             raise HTTPException(status_code=404, detail="folder not found or not allowed")
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # R5 — build the archive on disk (temp file) and stream it from there,
+        # rather than holding the whole ZIP in RAM.
+        tmp = tempfile.NamedTemporaryFile(prefix="stemforge-zip-", suffix=".zip", delete=False)
+        tmp.close()
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
             for f in sorted(d.rglob("*")):
                 if f.is_file():
                     zf.write(f, f.relative_to(d))
-        buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{d.name}.zip"'}
-        return StreamingResponse(buf, media_type="application/zip", headers=headers)
+        return FileResponse(
+            tmp.name, media_type="application/zip", filename=f"{d.name}.zip",
+            background=BackgroundTask(lambda p=tmp.name: Path(p).unlink(missing_ok=True)),
+        )
 
     @app.post("/api/open-folder")
     def open_folder(payload: dict[str, str]):
-        return {"message": reveal_folder(payload.get("path", ""))}
+        # R2 — guard like /api/file and /api/download-all: only reveal a folder
+        # inside the allowed output/upload roots.
+        raw = payload.get("path", "")
+        try:
+            d = Path(raw).resolve() if raw else None
+        except (OSError, RuntimeError):
+            d = None
+        if d is None or not d.is_dir() or not any(
+            r == d or r in d.parents for r in _allowed_roots()
+        ):
+            raise HTTPException(status_code=404, detail="folder not found or not allowed")
+        return {"message": reveal_folder(str(d))}
 
     return app
 
@@ -432,8 +528,16 @@ def _version() -> str:
 # --------------------------------------------------------------------------- #
 # Launch (uvicorn) — used by `stemforge ui`
 # --------------------------------------------------------------------------- #
-def launch(host: str = "127.0.0.1", port: int = 7860, open_browser: bool = True) -> None:
+def launch(host: str = "127.0.0.1", port: int = 7860, open_browser: bool = True,
+           allow_remote: bool = False, token: str | None = None) -> None:
     import uvicorn
+
+    # R1 — refuse a non-loopback bind unless explicitly opted in with a token,
+    # then enforce that token on /api/* (see create_app middleware).
+    token = token or os.environ.get("STEMFORGE_TOKEN") or None
+    require_safe_bind(host, allow_remote, token)
+    global _AUTH_TOKEN
+    _AUTH_TOKEN = token if not _is_loopback(host) else None
 
     if open_browser:
         _open_when_up(host, port)

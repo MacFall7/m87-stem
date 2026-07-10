@@ -265,6 +265,34 @@ def test_detect_bpm_route_failsoft_zero(client, monkeypatch):
     assert r.status_code == 200 and r.json() == {"bpm": 0.0, "half": 0.0, "double": 0.0}
 
 
-def test_open_folder_message(client):
-    r = client.post("/api/open-folder", json={"path": "/definitely/not/a/dir"})
-    assert r.status_code == 200 and "run a workflow" in r.json()["message"].lower()
+# --------------------------------------------------------------------------- #
+# C7 (H1) — server hardening
+# --------------------------------------------------------------------------- #
+def test_open_folder_outside_allowed_roots_rejected(client):
+    # R2/AC2 — a path outside the output/upload roots is refused (was 200 before).
+    r = client.post("/api/open-folder", json={"path": "/etc"})
+    assert r.status_code == 404
+    r2 = client.post("/api/open-folder", json={"path": "/definitely/not/a/dir"})
+    assert r2.status_code == 404
+
+
+def test_open_folder_allowed_dir_ok(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "reveal_folder", lambda p: f"opened {p}")
+    allowed = tmp_path / "out" / "song"
+    allowed.mkdir(parents=True)
+    r = client.post("/api/open-folder", json={"path": str(allowed)})
+    assert r.status_code == 200 and "opened" in r.json()["message"]
+
+
+def test_oversize_upload_rejected_413(client, monkeypatch):
+    # R3/AC3 — oversize upload rejected (streamed; capped before a full read).
+    monkeypatch.setattr(webapp, "_max_upload_bytes", lambda: 10)
+    r = client.post("/api/extract", files={"file": ("big.wav", b"x" * 4096, "audio/wav")})
+    assert r.status_code == 413
+
+
+def test_download_all_still_streams(client):
+    r = client.post("/api/extract", files={"file": ("mix.wav", _wav_bytes(), "audio/wav")})
+    out_dir = _poll(client, r.json()["job_id"])["result"]["out_dir"]
+    z = client.get("/api/download-all", params={"dir": out_dir})
+    assert z.status_code == 200 and z.content[:2] == b"PK"  # streamed from a temp file
