@@ -16,8 +16,10 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install numpy soundfile librosa pyyaml pretty_midi
-          pip install -e . --no-deps
+          # core deps + test (pytest, httpx) + web (fastapi, uvicorn, multipart)
+          # extras. torch is intentionally NOT installed — heavy libs load lazily
+          # and the GPU-dependent paths are mocked, so the suite is CPU-only.
+          pip install -e ".[dev,ui]"
       - name: Unit tests
         run: pytest -q
       - name: Accuracy benchmarks (threshold gate)
