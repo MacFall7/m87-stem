@@ -8,7 +8,9 @@ fixes: unknown tempo is 0.0 (never a silent 120) with confidence/candidates,
 the librosa meter is flagged assumed, and both analysis and stretch record a
 shared, sanitized EngineAttempt chain.
 
-GPU-free and deterministic (beat_this is absent, so analyze uses librosa).
+GPU-free and deterministic — analyze is driven to librosa either explicitly
+(engine="librosa") or by forcing the beat_this hop to fail, so the tests do not
+depend on whether beat_this happens to be installed.
 """
 
 from __future__ import annotations
@@ -108,10 +110,15 @@ def test_beatgrid_to_dict_carries_evidence():
     assert d["bpm_candidates"] == [60.0, 120.0, 240.0]
 
 
-def test_analyze_records_fallback_chain():
-    """beat_this is absent -> analyze records a fell_through hop with a sanitized
-    reason, then librosa used."""
-    g = analyze(_two_clicks())  # default engine="beat_this" -> falls to librosa
+def test_analyze_records_fallback_chain(monkeypatch):
+    """A beat_this failure -> analyze records a fell_through hop with a sanitized
+    reason, then librosa used. Force the failure so the test is isolated from the
+    environment (beat_this may or may not be installed — it is on Windows)."""
+    def _boom(*a, **k):
+        raise ImportError("No module named 'beat_this'")
+
+    monkeypatch.setattr(analysis, "_analyze_beat_this", _boom)
+    g = analyze(_two_clicks())  # default engine="beat_this" -> forced fallback to librosa
     assert g.engine == "librosa"
     chain = g.fallback_chain
     assert [c["engine"] for c in chain] == ["beat_this", "librosa"]
