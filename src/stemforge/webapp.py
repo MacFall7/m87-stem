@@ -173,7 +173,7 @@ def run_job(job_id: str, workflow: str, input_path: Path, params: dict[str, Any]
         else:
             _run_pipeline_job(job, workflow, input_path, params)
     except Exception as e:  # noqa: BLE001 - surface as a job error, don't crash the server
-        job.update(status="error", progress=1.0, message=str(e), error=str(e))
+        job.update(status="error", outcome="failed", progress=1.0, message=str(e), error=str(e))
     finally:
         job["finished_at"] = time.time()  # R4 — mark completion for TTL eviction
         try:
@@ -196,10 +196,20 @@ def _run_pipeline_job(job: dict, workflow: str, input_path: Path, params: dict[s
 
     out_dir = _out_dir_for(cfg, manifest)
     analysis = manifest.get("analysis", {})
+    # R4: reflect the run outcome distinctly. `failed` (a required stage errored)
+    # surfaces as an error job; `partial` is carried in the `outcome` field + a
+    # distinct message while status stays terminal-compatible with the SPA poll
+    # (a status-level "partial" render is a follow-up in web/, out of this scope).
+    outcome = manifest.get("outcome", "success")
+    status = "error" if outcome == "failed" else "done"
+    message = {"success": "Done", "partial": "Done — partial (some stages skipped/failed)",
+               "failed": "Failed — a required stage errored"}.get(outcome, "Done")
     job.update(
-        status="done", progress=1.0, message="Done",
+        status=status, outcome=outcome, progress=1.0, message=message,
+        error=(message if outcome == "failed" else None),
         result={
             "workflow": workflow,
+            "outcome": outcome,
             "out_dir": str(out_dir.resolve()),
             "bpm": analysis.get("source_bpm"),
             "key": analysis.get("key"),
@@ -322,7 +332,7 @@ def create_app():
             raise
         _JOBS[job_id] = {"status": "queued", "progress": 0.0, "stage": None,
                          "message": "Queued", "result": None, "error": None,
-                         "finished_at": None}
+                         "outcome": None, "finished_at": None}
         threading.Thread(target=run_job, args=(job_id, workflow, dest, params),
                          daemon=True).start()
         return {"job_id": job_id}

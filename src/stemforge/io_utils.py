@@ -161,11 +161,23 @@ def slugify(name: str) -> str:
     return "_".join(cleaned.split()) or "song"
 
 
-def receipt(files: Iterable[PathLike]) -> dict[str, str]:
-    """Map of relative filename -> sha256. The artifact-completion receipt."""
+def receipt(files: Iterable[PathLike], root: PathLike) -> dict[str, str]:
+    """Map of run-root-relative POSIX path -> sha256 (the completion receipt).
+
+    Keys are relative to ``root`` (the run's output dir), NOT basenames, so two
+    files sharing a name in different subdirs (``stems/other.wav`` and
+    ``drums/other.wav``) get distinct, collision-free keys. A file outside
+    ``root`` falls back to its basename.
+    """
+    root_res = Path(root).resolve()
     out: dict[str, str] = {}
     for f in files:
         p = Path(f)
-        if p.is_file():
-            out[p.name] = sha256_file(p)
+        if not p.is_file():
+            continue
+        try:
+            key = p.resolve().relative_to(root_res).as_posix()
+        except ValueError:
+            key = p.name
+        out[key] = sha256_file(p)
     return out

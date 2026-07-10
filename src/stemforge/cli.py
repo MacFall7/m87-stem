@@ -82,6 +82,19 @@ def _summarize(manifest: dict) -> None:
     console.print(t)
 
 
+def _exit_on_failed(manifest: dict) -> None:
+    """Exit non-zero when a required stage errored (outcome=='failed'). R4.
+
+    ``partial`` (a non-required stage skipped/errored) and ``success`` exit 0.
+    """
+    outcome = manifest.get("outcome")
+    if outcome:
+        color = {"success": "green", "partial": "yellow", "failed": "red"}.get(outcome, "dim")
+        console.print(f"[{color}]outcome: {outcome}[/]")
+    if outcome == "failed":
+        raise typer.Exit(code=1)
+
+
 # --------------------------------------------------------------------------- #
 @app.command()
 def doctor() -> None:
@@ -176,6 +189,7 @@ def separate(
     cfg = load_config(overrides=overrides)
     manifest = Pipeline(cfg).run(input)
     _summarize(manifest)
+    _exit_on_failed(manifest)
 
 
 @app.command()
@@ -275,6 +289,7 @@ def run(
     manifest = Pipeline(cfg).run(input)
     _summarize(manifest)
     console.print(f"[dim]manifest:[/] {Path(cfg.output.root) / manifest['input']['filename'].rsplit('.',1)[0] / 'manifest.json'}")
+    _exit_on_failed(manifest)
 
 
 @app.command()

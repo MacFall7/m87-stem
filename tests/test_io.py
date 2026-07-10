@@ -31,7 +31,7 @@ def test_save_load_roundtrip(tmp_path, sine):
 def test_receipt_hashes(tmp_path, sine):
     samples, sr = sine
     p = save_audio(tmp_path / "a.wav", AudioTensor(samples, sr))
-    r = receipt([p])
+    r = receipt([p], tmp_path)
     assert "a.wav" in r
     assert len(r["a.wav"]) == 64  # sha256 hex
 
