@@ -120,6 +120,13 @@ stemforge ui --no-open       # start it without opening a browser
 stemforge desktop-shortcut   # create a double-clickable Desktop launcher
 ```
 
+> **Security — local-only by default.** The UI binds to `127.0.0.1` and trusts
+> anything on localhost (no auth). Exposing it on a network is opt-in and gated:
+> a non-loopback `--host` is **refused** unless you pass `--allow-remote` **and** a
+> `--token` (or set `STEMFORGE_TOKEN`), after which every `/api` request must send
+> `X-StemForge-Token`. Uploads are size-capped (`STEMFORGE_MAX_UPLOAD_MB`, default
+> 512) and streamed to disk; finished jobs are evicted after `STEMFORGE_JOB_TTL_S`.
+
 The web UI is the **StemForge workstation** — a bespoke local web app (a FastAPI
 backend + a custom single-page front-end served by uvicorn; no Gradio). A dark,
 deep-space console with a left workflow rail and four panels, no page reloads:

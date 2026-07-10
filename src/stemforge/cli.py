@@ -284,12 +284,27 @@ def ui(
     open_browser: bool = typer.Option(
         True, "--open/--no-open", help="Open the app in a browser once the server is up."
     ),
+    allow_remote: bool = typer.Option(
+        False, "--allow-remote", help="Permit a non-loopback bind (needs --token). Localhost is trust-all."
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Auth token required on /api when binding a remote host (or set STEMFORGE_TOKEN)."
+    ),
 ) -> None:
-    """Launch the StemForge workstation (bespoke FastAPI web app, served by uvicorn)."""
+    """Launch the StemForge workstation (bespoke FastAPI web app, served by uvicorn).
+
+    Binds to 127.0.0.1 (trust-all localhost) by default; a non-loopback --host is
+    refused unless you pass --allow-remote AND a --token (or STEMFORGE_TOKEN).
+    """
     from .webapp import launch
 
     console.print(f"[green]StemForge[/] → http://{host}:{port}/")
-    launch(host=host, port=port, open_browser=open_browser)
+    try:
+        launch(host=host, port=port, open_browser=open_browser,
+               allow_remote=allow_remote, token=token)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(code=2)
 
 
 @app.command("desktop-shortcut")
