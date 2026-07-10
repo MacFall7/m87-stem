@@ -27,8 +27,10 @@ parts feed the existing parts-based ``drum_midi`` (onset + RMS-velocity + GM).
 
 from __future__ import annotations
 
+import contextlib
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -323,22 +325,24 @@ def _load_inagoy_model(cfg: "DrumSplitCfg", device: str):
     return model, dest.name
 
 
-def _load_demucs_checkpoint(load_model, dest: Path):
-    """Load a trusted demucs checkpoint across torch versions.
+# Serializes the (brief) weights_only relaxation so it can never race a sibling
+# thread or be left half-applied (H2v2/R3 — replaces the old unguarded global patch).
+_TORCH_LOAD_LOCK = threading.Lock()
 
-    torch>=2.6 flipped ``torch.load(weights_only=True)`` on by default, which
-    rejects the pickled demucs model classes (``UnpicklingError: Unsupported
-    global: GLOBAL demucs.hdemucs.HDemucs was not an allowed global by
-    default``). The drumsep checkpoint is a trusted MIT file, so on that failure
-    we retry with ``weights_only=False`` (``demucs.states.load_model`` doesn't
-    expose the flag, so we patch ``torch.load`` for the retry). On older torch
-    the first attempt already succeeds and the retry never runs.
+
+@contextlib.contextmanager
+def _relaxed_torch_load():
+    """A LOCKED, self-restoring scope that relaxes torch>=2.6's ``weights_only``
+    guard for ONE trusted, hash-verified load.
+
+    Replaces the old process-global ``torch.load`` monkeypatch: the module lock
+    serializes the window (a sibling thread cannot race the reassignment or observe
+    a half-applied state), and ``torch.load`` is restored on EVERY exit, including
+    exceptions. C1's sha256 gate still runs before any load reaches here.
     """
-    try:
-        return load_model(str(dest))
-    except Exception:  # noqa: BLE001 - retry allowing the trusted full unpickle
-        import torch
+    import torch
 
+    with _TORCH_LOAD_LOCK:
         orig_load = torch.load
 
         def _trusted_load(*args, **kwargs):
@@ -347,9 +351,27 @@ def _load_demucs_checkpoint(load_model, dest: Path):
 
         torch.load = _trusted_load
         try:
-            return load_model(str(dest))
+            yield
         finally:
             torch.load = orig_load
+
+
+def _load_demucs_checkpoint(load_model, dest: Path):
+    """Load a trusted demucs checkpoint across torch versions.
+
+    torch>=2.6 flipped ``torch.load(weights_only=True)`` on by default, which
+    rejects the pickled demucs model classes (``UnpicklingError: Unsupported
+    global: GLOBAL demucs.hdemucs.HDemucs was not an allowed global by
+    default``). The drumsep checkpoint is a trusted MIT file (and hash-verified by
+    C1 before we get here), so on that failure we retry inside the locked,
+    self-restoring :func:`_relaxed_torch_load` scope. On older torch the first
+    attempt already succeeds and the retry never runs.
+    """
+    try:
+        return load_model(str(dest))
+    except Exception:  # noqa: BLE001 - retry allowing the trusted full unpickle
+        with _relaxed_torch_load():
+            return load_model(str(dest))
 
 
 # --------------------------------------------------------------------------- #

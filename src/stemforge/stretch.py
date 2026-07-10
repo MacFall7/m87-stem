@@ -35,6 +35,35 @@ def _resolve_device(device: str) -> str:
         return "cpu"
 
 
+def stretch_with_engine(
+    audio: AudioTensor,
+    ratio: float,
+    engine: str = "rubberband",
+    crisp: int = 5,
+    preserve_formant: bool = False,
+) -> tuple[AudioTensor, str]:
+    """Stretch and report the engine ACTUALLY used (after any fallback).
+
+    The chain degrades rubberband → signalsmith → librosa; the returned label is
+    the engine that actually produced the audio — so callers record the truth,
+    not the request (the old code fell through to librosa without ever updating
+    the label). Identity ratio does no work and reports ``"none"``.
+    """
+    if abs(ratio - 1.0) < 1e-6:
+        return audio, "none"
+    if engine == "rubberband":
+        try:
+            return _rubberband(audio, ratio, crisp, preserve_formant), "rubberband"
+        except Exception:
+            engine = "signalsmith"
+    if engine == "signalsmith":
+        try:
+            return _signalsmith(audio, ratio), "signalsmith"
+        except Exception:
+            pass
+    return _librosa(audio, ratio), "librosa"
+
+
 def time_stretch(
     audio: AudioTensor,
     ratio: float,
@@ -42,19 +71,8 @@ def time_stretch(
     crisp: int = 5,
     preserve_formant: bool = False,
 ) -> AudioTensor:
-    if abs(ratio - 1.0) < 1e-6:
-        return audio
-    if engine == "rubberband":
-        try:
-            return _rubberband(audio, ratio, crisp, preserve_formant)
-        except Exception:
-            engine = "signalsmith"
-    if engine == "signalsmith":
-        try:
-            return _signalsmith(audio, ratio)
-        except Exception:
-            pass
-    return _librosa(audio, ratio)
+    """Backwards-compatible wrapper returning only the audio (engine discarded)."""
+    return stretch_with_engine(audio, ratio, engine, crisp, preserve_formant)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -150,14 +168,15 @@ def match_bpm_file(
             return {"skipped": "no detectable BPM; pass source_bpm to override"}
 
         ratio = float(target_bpm) / src
-        out = time_stretch(audio, ratio, engine=engine, crisp=crisp)
+        out, used_engine = stretch_with_engine(audio, ratio, engine=engine, crisp=crisp)
         stem = out_name or f"{slugify(Path(input_path).stem)}_{int(round(float(target_bpm)))}bpm.wav"
         outp = save_audio(Path(out_dir) / stem, out)
     except Exception as e:  # noqa: BLE001 - never raise; surface as a soft error
         return {"error": f"match-bpm failed: {e}"}
 
     return {
-        "engine": engine,
+        "engine": used_engine,           # actual engine after any fallback
+        "engine_requested": engine,
         "detect_engine": detect_engine,
         "source_bpm": round(src, 3),
         "source_bpm_detected": round(detected, 3),
@@ -186,12 +205,14 @@ def stretch_stems(
 
     out_dir = Path(out_dir)
     result: dict[str, Any] = {
-        "engine": cfg.engine,
+        "engine": cfg.engine,            # actual engine used (overwritten below)
+        "engine_requested": cfg.engine,
         "source_bpm": round(float(source_bpm), 3),
         "target_bpm": cfg.target_bpm,
         "ratios": {},
         "files": {},
     }
+    engines_used: list[str] = []
     for name, path in stems.items():
         target = cfg.per_stem_target_bpm.get(name, cfg.target_bpm)
         if not target:
@@ -199,9 +220,13 @@ def stretch_stems(
         ratio = float(target) / float(source_bpm)
         audio = load_audio(path)
         formant = cfg.preserve_formant and name == "vocals"
-        out = time_stretch(audio, ratio, engine=cfg.engine, crisp=cfg.crisp,
-                           preserve_formant=formant)
+        out, used = stretch_with_engine(audio, ratio, engine=cfg.engine, crisp=cfg.crisp,
+                                        preserve_formant=formant)
+        engines_used.append(used)
         outp = save_audio(out_dir / f"{name}_{int(round(float(target)))}bpm.wav", out)
         result["ratios"][name] = round(ratio, 4)
         result["files"][name] = str(outp)
+    if engines_used:
+        uniq = sorted(set(engines_used))
+        result["engine"] = uniq[0] if len(uniq) == 1 else uniq
     return result

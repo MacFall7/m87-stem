@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import os
+import shutil
 import traceback
+import uuid
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -330,9 +333,52 @@ class RunContext:
     manifest: dict[str, Any] = field(default_factory=dict)
     beat_grid: Any = None
     stems: dict[str, Path] = field(default_factory=dict)
+    stage_status: dict[str, str] = field(default_factory=dict)
 
     def subdir(self, name: str) -> Path:
         return ensure_dir(self.out_dir / name)
+
+
+# All pipeline stage keys, in run order.
+_STAGE_KEYS = ("analysis", "separation", "midi", "drum_split", "drum_midi", "stretch")
+# Output-producing stages (analysis is shared prep, not an artifact stage) — the
+# default "required" set is whichever of these a run has enabled.
+_OUTPUT_STAGES = ("separation", "midi", "drum_split", "drum_midi", "stretch")
+
+
+def _apply_seed(seed: int) -> None:
+    """Seed numpy (+ torch if importable) at run start so runs are reproducible.
+
+    Closes M1/R6 — ``cfg.seed`` was a silent no-op. Best-effort: torch is
+    optional and its absence never breaks a run.
+    """
+    import numpy as np
+
+    np.random.seed(int(seed) & 0xFFFFFFFF)  # numpy seed domain is [0, 2**32)
+    try:
+        import torch
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+    except Exception:  # noqa: BLE001 - torch optional; seeding is best-effort
+        pass
+
+
+def _compute_outcome(stage_status: dict[str, str], required: set[str]) -> str:
+    """``success | partial | failed`` from per-stage status + a required set.
+
+    A required stage that errored or skipped → ``failed``. Otherwise any enabled
+    stage that errored or skipped → ``partial``. All enabled stages succeeded →
+    ``success``. ``disabled`` stages never count against the outcome (the user
+    chose not to run them). Fail-soft stays; only the label stops lying.
+    """
+    for s in required:
+        if stage_status.get(s) in ("error", "skipped"):
+            return "failed"
+    if any(v in ("error", "skipped") for v in stage_status.values()):
+        return "partial"
+    return "success"
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +391,7 @@ class Pipeline:
     """
 
     def __init__(self, cfg: RunConfig, model_cache: dict[str, Any] | None = None,
-                 on_stage=None):
+                 on_stage=None, required_stages: set[str] | None = None):
         self.cfg = cfg
         # Keyed "<backend>:<model name>" so a shared cache (e.g. across UI runs
         # with different presets) can never hand back the wrong weights.
@@ -353,6 +399,9 @@ class Pipeline:
         # Optional callback(stage_key, enabled) fired as each stage starts — the
         # web UI maps it to progress. Never affects results; failures are ignored.
         self._on_stage = on_stage
+        # Stages that MUST succeed for outcome=="success"; None -> the enabled
+        # output stages (see _resolve_required). Drives outcome + CLI exit code.
+        self._required_stages = required_stages
 
     def resolve_device(self) -> str:
         if self.cfg.device != "auto":
@@ -368,10 +417,17 @@ class Pipeline:
         from . import ingest as ingest_mod
 
         cfg = self.cfg
+        _apply_seed(cfg.seed)  # R6/M1 — seed RNGs before any stochastic stage
         ipath = Path(input_path)
         song = slugify(ipath.stem)
-        out_dir = ensure_dir(Path(cfg.output.root) / song)
         device = self.resolve_device()
+
+        # R2: every run stages into its OWN fresh dir, then atomically publishes.
+        # The receipt is therefore computed over this run's files only — a stale
+        # file from a prior run can never enter the manifest.
+        root = ensure_dir(Path(cfg.output.root))
+        final_dir = root / song
+        run_dir = ensure_dir(root / f".run-{song}-{uuid.uuid4().hex[:12]}")
 
         audio = ingest_mod.ingest(
             ipath,
@@ -381,11 +437,12 @@ class Pipeline:
             target_lufs=cfg.ingest.target_lufs,
         )
 
-        ctx = RunContext(input_path=ipath, song=song, out_dir=out_dir, audio=audio, device=device)
+        ctx = RunContext(input_path=ipath, song=song, out_dir=run_dir, audio=audio, device=device)
         ctx.manifest = {
             "stemforge_version": __version__,
             "created": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "device": device,
+            "seed": cfg.seed,  # R5 — the seed actually applied to the RNGs
             "input": {
                 "path": str(ipath),
                 "filename": ipath.name,
@@ -404,12 +461,47 @@ class Pipeline:
         self._stage(ctx, "drum_midi", self._run_drum_midi, cfg.drums.midi.enabled)
         self._stage(ctx, "stretch", self._run_stretch, cfg.stretch.enabled)
 
-        produced = [p for p in out_dir.rglob("*") if p.is_file() and p.name != "manifest.json"]
-        ctx.manifest["receipt"] = receipt(produced)
+        produced = [p for p in run_dir.rglob("*") if p.is_file() and p.name != "manifest.json"]
+        ctx.manifest["receipt"] = receipt(produced, run_dir)  # R1 — keys relative to run root
+        ctx.manifest["stages"] = dict(ctx.stage_status)       # R5 — per-stage status
+        required = self._resolve_required(cfg)
+        ctx.manifest["required_stages"] = sorted(required)
+        ctx.manifest["outcome"] = _compute_outcome(ctx.stage_status, required)  # R3
 
         if cfg.output.write_manifest:
-            write_json(out_dir / "manifest.json", ctx.manifest)
+            write_json(run_dir / "manifest.json", ctx.manifest)
+        self._finalize(run_dir, final_dir)  # R2 — atomic publish of the fresh run
         return ctx.manifest
+
+    def _resolve_required(self, cfg: RunConfig) -> set[str]:
+        """Required-stage set: explicit override, else the enabled output stages."""
+        if self._required_stages is not None:
+            return set(self._required_stages)
+        enabled = {
+            "separation": cfg.separation.enabled,
+            "midi": cfg.midi.enabled,
+            "drum_split": cfg.drums.split.enabled,
+            "drum_midi": cfg.drums.midi.enabled,
+            "stretch": cfg.stretch.enabled,
+        }
+        return {k for k in _OUTPUT_STAGES if enabled.get(k)}
+
+    @staticmethod
+    def _finalize(run_dir: Path, final_dir: Path) -> None:
+        """Atomically publish ``run_dir`` as ``final_dir`` (same filesystem).
+
+        Replaces any prior output dir wholesale, so the published bundle contains
+        ONLY this run's artifacts + manifest (no stale carry-over).
+        """
+        if final_dir.exists():
+            old = final_dir.with_name(f"{final_dir.name}.old-{uuid.uuid4().hex[:8]}")
+            os.replace(final_dir, old)      # move current aside (atomic)
+            try:
+                os.replace(run_dir, final_dir)  # publish new (atomic)
+            finally:
+                shutil.rmtree(old, ignore_errors=True)
+        else:
+            os.replace(run_dir, final_dir)
 
     def run_batch(self, paths: list[PathLike]) -> list[dict[str, Any]]:
         return [self.run(p) for p in paths]
@@ -422,6 +514,7 @@ class Pipeline:
                 pass
         if not enabled:
             ctx.manifest.setdefault(key, {"skipped": "disabled"})
+            ctx.stage_status[key] = "disabled"
             return
         try:
             fn(ctx)
@@ -430,6 +523,17 @@ class Pipeline:
                 "error": f"{type(e).__name__}: {e}",
                 "trace": traceback.format_exc(limit=3),
             }
+            ctx.stage_status[key] = "error"
+            return
+        # Classify from what the stage recorded: many stages fail soft by writing
+        # {"skipped": ...} / {"error": ...} into the manifest instead of raising.
+        entry = ctx.manifest.get(key)
+        if isinstance(entry, dict) and "error" in entry:
+            ctx.stage_status[key] = "error"
+        elif isinstance(entry, dict) and "skipped" in entry:
+            ctx.stage_status[key] = "skipped"
+        else:
+            ctx.stage_status[key] = "success"
 
     def _run_analysis(self, ctx: RunContext) -> None:
         from . import analysis
