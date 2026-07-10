@@ -1,0 +1,9 @@
+# StemForge accuracy thresholds (PR-A5). CI fails the build if a metric regresses
+# past one of these bounds. Values are set with margin over a clean baseline run
+# (see benchmarks/README.md); tighten them as accuracy improves.
+
+tempo_abs_error_bpm_max: 6.0     # max |true - estimated| BPM over the tempo corpus (baseline 2.3)
+half_double_correct: 1.0         # fraction of fixtures whose true octave is in the candidates
+drum_f1_min: 0.9                 # worst per-fixture kick/snare onset F1 (baseline 1.0)
+duplicate_rate_max: 0.02         # cross-part coincident-duplicate rate — bleed de-dup keeps it ~0
+velocity_rank_corr_min: 0.4      # velocity vs render-amplitude rank correlation (baseline 0.64)
