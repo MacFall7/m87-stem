@@ -63,7 +63,13 @@ def transcribe(
     beat_grid: Any = None,
 ) -> dict[str, Any]:
     out_dir = Path(out_dir)
-    bpm = float(getattr(beat_grid, "source_bpm", 0) or 120.0)
+    # A real, measured tempo drives the .mid; when it's UNKNOWN (0.0) we still must
+    # write *some* tempo to serialize the file, so we use 120 but flag it as a
+    # serialization default (tempo_assumed) rather than passing it off as detected.
+    src_bpm = float(getattr(beat_grid, "source_bpm", 0) or 0.0)
+    tempo_assumed = src_bpm <= 0.0
+    bpm = src_bpm if src_bpm > 0 else 120.0
+    tempo_source = "beat_grid" if src_bpm > 0 else "midi_serialization_default"
 
     # 1) SOTA path: let ADTOF (or another ADT) write the MIDI, we adopt it.
     if cfg.external_cmd:
@@ -71,7 +77,12 @@ def transcribe(
 
     # 2) Parts-based path: build the MIDI from separated parts.
     if drum_parts:
-        return _from_parts(drum_parts, cfg, out_dir, bpm)
+        res = _from_parts(drum_parts, cfg, out_dir, bpm)
+        if "file" in res:  # annotate a produced MIDI with its tempo provenance
+            res["tempo_bpm"] = round(bpm, 3)
+            res["tempo_source"] = tempo_source
+            res["tempo_assumed"] = tempo_assumed
+        return res
 
     return {
         "skipped": (
