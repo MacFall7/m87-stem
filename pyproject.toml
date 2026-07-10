@@ -90,3 +90,6 @@ target-version = "py311"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Put the repo root on sys.path so tests can import the top-level `benchmarks`
+# package under a bare `pytest` invocation (CI), matching `python -m pytest`.
+pythonpath = ["."]

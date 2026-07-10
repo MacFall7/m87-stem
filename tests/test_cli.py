@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -9,6 +10,15 @@ from typer.testing import CliRunner
 from stemforge import cli
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Strip ANSI color codes. CI sets FORCE_COLOR, so Rich colorizes --help and
+    splits option tokens (e.g. `--preset`) with escape codes; comparisons must run
+    against the plain text, not the styled bytes."""
+    return _ANSI.sub("", text)
 
 
 class _FakePipeline:
@@ -93,7 +103,7 @@ def test_help_lists_preset():
     for cmd in ("run", "separate"):
         result = runner.invoke(cli.app, [cmd, "--help"])
         assert result.exit_code == 0
-        assert "--preset" in result.output
+        assert "--preset" in _plain(result.output)
 
 
 def test_setup_sota_invokes_provisioner(monkeypatch, tmp_path):
