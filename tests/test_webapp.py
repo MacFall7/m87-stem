@@ -201,6 +201,31 @@ def test_favicon_returns_204_not_404(client):
     assert client.get("/favicon.ico").status_code == 204
 
 
+def test_job_status_serializes_numpy_scalars(client):
+    """A producer may leave a numpy scalar in a job; FastAPI's pydantic serializer
+    has no default hook and 500s on np.bool_. GET /api/job/{id} must round-trip it
+    to plain, valid JSON (the frontend JSON.parse depends on this)."""
+    import numpy as np
+
+    jid = "npjob00beef1"
+    webapp._JOBS[jid] = {
+        "status": "done", "progress": 1.0, "stage": None, "message": "Done",
+        "error": None, "outcome": "success", "finished_at": None,
+        "result": {"flag": np.bool_(True), "score": np.float64(0.5),
+                   "n": np.int64(3), "arr": np.arange(2)},
+    }
+    try:
+        r = client.get(f"/api/job/{jid}")
+        assert r.status_code == 200            # was 500 (PydanticSerializationError)
+        body = r.json()                        # valid JSON
+        assert body["result"]["flag"] is True
+        assert body["result"]["score"] == 0.5
+        assert body["result"]["n"] == 3
+        assert body["result"]["arr"] == [0, 1]
+    finally:
+        webapp._JOBS.pop(jid, None)
+
+
 # --------------------------------------------------------------------------- #
 # Match BPM (whole-file) — stretch.match_bpm_file mocked
 # --------------------------------------------------------------------------- #

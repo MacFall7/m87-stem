@@ -408,7 +408,12 @@ def create_app():
         job = _JOBS.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job")
-        return job
+        # FastAPI/pydantic serializes the return value with NO json default hook and
+        # 500s on a numpy scalar (e.g. an np.bool_ a producer left in the job dict).
+        # Round-trip through our numpy-aware encoder so the client gets plain JSON.
+        from .io_utils import _json_default
+
+        return json.loads(json.dumps(job, default=_json_default))
 
     @app.get("/api/progress/{job_id}")
     def progress(job_id: str):
