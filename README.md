@@ -153,12 +153,47 @@ Every run writes a per-song bundle:
 
 ```
 out/<song>/
-├─ stems/       vocals.wav drums.wav bass.wav other.wav [guitar.wav piano.wav]
-├─ midi/        bass.mid other.mid ...
-├─ drums/       kick.wav snare.wav toms.wav other.wav  +  drums.mid
-├─ stretched/   <stem>_<bpm>bpm.wav
-└─ manifest.json   source/target BPM, beat grid, model versions, per-stem ratios
+├─ stems/           vocals.wav drums.wav bass.wav other.wav [guitar.wav piano.wav]
+├─ midi/<stem>/     raw.mid  cleaned.mid  quantized.mid  events.json   # transform ledger
+├─ drums/           kick.wav snare.wav toms.wav other.wav  +  drums.mid
+├─ stretched/       <stem>_<bpm>bpm.wav
+└─ manifest.json    run outcome + file receipt, tempo evidence, per-stem ratios, versions
 ```
+
+---
+
+## Accuracy & evidence
+
+Every stage records *why* it produced what it did, so a result is auditable — not
+a black box. The manifest never lies about what happened:
+
+- **Honest run outcome** — `manifest.outcome ∈ {success, partial, failed}` from a
+  required-stage set; the CLI exits non-zero when a required stage errored. Each
+  run stages into a unique dir and is atomically finalized, and the manifest
+  carries a **sha256 receipt** of every produced file (collision-free paths).
+- **Tempo evidence** — the beat grid reports `source_bpm` (`0.0` == *unknown*,
+  never a silent 120), `bpm_confidence`, `bpm_candidates` (always incl. half/double),
+  `meter_confidence`, `tempo_assumed`, and a `fallback_chain` of `EngineAttempt`
+  records. The stretch chain (rubberband → signalsmith → librosa) records the
+  same sanitized `attempts[]` — no swallowed fallback reasons.
+- **Cymbal MIDI on the default path** — the drum teardown's `other` stem (which
+  bundles all cymbals) is classified per-onset into closed/open hi-hat, ride, or
+  crash; the manifest reports `cymbal_classes` + `cymbal_rejected`.
+- **Calibrated drum MIDI** — per-part velocity normalization, cross-part bleed
+  de-dup (`duplicates_removed`), toms split low/mid/high by pitch, and a per-event
+  record `{time, part, note, raw_strength, normalized_strength, velocity}`. Every
+  threshold is a validated config knob.
+- **Melodic MIDI ledger** — the raw Basic Pitch prediction is preserved
+  (`raw.mid`, never overwritten); `events.json` records each note's confidence,
+  drop reason (monophonic cleanup), and quantize delta, and **reconstructs**
+  `cleaned.mid`/`quantized.mid` from `raw` exactly.
+
+A synthetic **benchmark corpus** (`benchmarks/`) with a known ground truth gates
+these on every push: `python -m benchmarks.run_benchmarks` measures tempo error,
+half/double correctness, drum onset F1, cross-part duplicate rate, and velocity
+rank correlation against `benchmarks/thresholds.yaml`, and CI fails the build on a
+regression. Every report embeds provenance (fixture SHA-256, config hash,
+library/model versions).
 
 ---
 
@@ -168,12 +203,12 @@ out/<song>/
 |-------|--------|--------|
 | 0 | env / GPU sanity | ✅ `stemforge doctor` |
 | 1 | Demucs separation | ✅ working |
-| 2 | analysis (beat_this/librosa) + Rubber Band stretch | ✅ working |
-| 3 | melodic MIDI (Basic Pitch ONNX) | 🟡 interface complete; drop in `basic_pitch.onnx` |
+| 2 | analysis (beat_this/librosa) + Rubber Band stretch | ✅ working — with tempo evidence |
+| 3 | melodic MIDI (Basic Pitch ONNX) | 🟡 interface + transform ledger complete; drop in `basic_pitch.onnx` |
 | 4 | drum teardown (inagoy/drumsep Demucs, main env) | ✅ working — loop/stem → hit stems |
-| 5 | drum MIDI (parts-based, GM + velocity) | ✅ working — loop → GM `.mid` (ADTOF path optional) |
+| 5 | drum MIDI (parts-based, GM + velocity) | ✅ working — cymbals + calibrated velocity/de-dup |
 | 6 | orchestrator + StemForge workstation UI | ✅ working |
-| 7 | hardening / golden-file tests | 🟡 in progress |
+| 7 | hardening / accuracy benchmarks | ✅ server hardening + CI-gated benchmark corpus |
 
 ✅ = runs today · 🟡 = interface + logic in place, needs the external model weight/repo wired
 
@@ -188,6 +223,8 @@ stemforge/
 ├─ pyproject.toml
 ├─ configs/default.yaml       # every knob, maps to RunConfig
 ├─ models/                    # downloaded weights (git-ignored)
+├─ benchmarks/                # synthetic accuracy corpus + metrics + threshold gate
+├─ .github/workflows/         # CI: unit tests + the benchmark gate
 ├─ src/stemforge/
 │  ├─ ingest.py  analysis.py  separate.py  separate_uvr.py  midi_melodic.py
 │  ├─ drum_split.py  drum_midi.py  stretch.py  desktop.py
